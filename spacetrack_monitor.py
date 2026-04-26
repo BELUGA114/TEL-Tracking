@@ -227,8 +227,8 @@ def wait_until(target: datetime) -> None:
         secs = (target - datetime.now(timezone.utc)).total_seconds()
         if secs <= 0:
             return
-        # 首次或剩余时间少于 5 分钟时打印日志
-        if first_log or secs < 300:
+        # 首次或剩余时间少于 10 分钟时打印日志
+        if first_log or secs < 600:
             log.info(
                 "下次查询：%s UTC（%.0f 分钟后）",
                 target.strftime("%H:%M"),
@@ -805,21 +805,21 @@ def main() -> None:
         while True:
             # === 确定是否需要等待 ===
             if first_run:
-                # 首次启动：检查距上次请求的时间
+                # 本轮首次迭代：检查距上次请求的时间
                 first_run = False
                 secs_since = cache.seconds_since_last_fetch()
                 if secs_since == float("inf"):
                     # 从未请求过，立即执行首次查询
-                    log.info("首次启动：无历史记录，将立即执行首次查询")
-                    write_log_message("首次启动：无历史记录，立即执行首次查询")
+                    log.info("无历史记录，将立即执行首次查询")
+                    write_log_message("无历史记录，立即执行首次查询")
                 elif secs_since < MIN_REQUEST_INTERVAL:
-                    # 距上次请求不足 1 小时，需要等待
+                    # 距上次请求不足 1 小时，需要等待以满足速率限制
                     wait_seconds = MIN_REQUEST_INTERVAL - secs_since
                     log.warning(
-                        "首次启动：距上次请求仅 %.0f 分钟，需等待 %.0f 分钟以满足速率限制",
+                        "距上次请求仅 %.0f 分钟，需等待 %.0f 分钟以满足速率限制",
                         secs_since / 60, wait_seconds / 60
                     )
-                    write_log_message(f"首次启动速率保护：需等待 {wait_seconds/60:.0f} 分钟")
+                    write_log_message(f"速率保护：需等待 {wait_seconds/60:.0f} 分钟")
                     time.sleep(wait_seconds)
                 # 如果 secs_since >= MIN_REQUEST_INTERVAL，无需等待，直接执行
             else:
