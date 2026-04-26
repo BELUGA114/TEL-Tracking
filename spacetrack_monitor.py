@@ -67,6 +67,9 @@ SESSION_MAX_AGE = 5400
 # 日志文件最大大小（字节），超过后自动轮转（10 MB）
 MAX_LOG_SIZE = 10 * 1024 * 1024
 
+# 安全的回退时间值（用于排序）
+_EPOCH_MIN = datetime(2000, 1, 1, tzinfo=timezone.utc)
+
 # Space-Track API 地址
 BASE_URL = "https://www.space-track.org"
 LOGIN_URL = f"{BASE_URL}/ajaxauth/login"
@@ -209,7 +212,7 @@ def next_scheduled_time(minute: int = SCHEDULED_MINUTE) -> datetime:
     now = datetime.now(timezone.utc)
     target = now.replace(minute=minute, second=0, microsecond=0)
     # 如果当前时间已超过目标时间，则推到下一小时
-    while target <= now:
+    if target <= now:
         target += timedelta(hours=1)
     return target
 
@@ -329,7 +332,6 @@ class SpaceTrackSession:
                     LOGIN_MAX_FAILURES,
                     LOGIN_PAUSE_SECONDS // 60,
                 )
-                time.sleep(LOGIN_PAUSE_SECONDS)
         return False
 
     def ensure_fresh_session(self) -> bool:
@@ -421,6 +423,16 @@ def fetch_bulk_with_relogin(st: SpaceTrackSession) -> Optional[list[dict]]:
     return result
 
 
+def _record_sort_key(rec: dict) -> tuple[datetime, int]:
+    """记录排序键：优先按 CREATION_DATE，其次按 FILE 号"""
+    creation = parse_datetime_utc(rec.get("CREATION_DATE")) or _EPOCH_MIN
+    try:
+        file_no = int(rec.get("FILE") or 0)
+    except (ValueError, TypeError):
+        file_no = 0
+    return (creation, file_no)
+
+
 def filter_by_norad(records: list[dict], norad_ids: list[int]) -> dict[int, list[dict]]:
     """
     从批量结果中筛选目标 NORAD ID
@@ -440,17 +452,7 @@ def filter_by_norad(records: list[dict], norad_ids: list[int]) -> dict[int, list
     # 对每个卫星的记录按时间排序（从旧到新）
     found: dict[int, list[dict]] = {}
     for nid, recs in grouped.items():
-        def sort_key(rec: dict) -> tuple[datetime, datetime, int]:
-            creation = parse_datetime_utc(rec.get("CREATION_DATE")) or datetime.min.replace(tzinfo=timezone.utc)
-            epoch = parse_datetime_utc(rec.get("EPOCH")) or datetime.min.replace(tzinfo=timezone.utc)
-            try:
-                file_no = int(rec.get("FILE") or 0)
-            except (ValueError, TypeError):
-                file_no = 0
-            return (creation, epoch, file_no)
-
-        # 按时间排序，保留所有记录
-        found[nid] = sorted(recs, key=sort_key)
+        found[nid] = sorted(recs, key=_record_sort_key)
     return found
 
 
@@ -628,9 +630,9 @@ def process_records(
             continue
 
         # 处理该卫星的所有历史记录
+        prev = prev_data.get(norad_id)
         for record in record_list:
             orbit = parse_orbit(record)
-            prev = prev_data.get(norad_id)
             cur_hash = orbit["tle_hash"]
 
             # 检测 TLE 是否变化
@@ -642,8 +644,9 @@ def process_records(
                 log_record(orbit)
                 prev_data[norad_id] = orbit
                 last_hash[norad_id] = cur_hash
+                prev = orbit
             elif not ONLY_PRINT_ON_UPDATE:
-                print_orbit(orbit, prev)
+                print_orbit(orbit, None)
             else:
                 msg = f"[{norad_id}] {orbit['name']}：TLE 未变化（hash {cur_hash}）"
                 log.info(msg)
@@ -669,7 +672,7 @@ def main() -> None:
         log.error("请在 .env 文件中设置 SPACETRACK_USER 和 SPACETRACK_PASS")
         raise SystemExit(1)
 
-    log.info("Space-Track 轨道监控（合规版）")
+    log.info("Space-Track 轨道监控")
     log.info("目标: %s", ", ".join(str(i) for i in NORAD_IDS))
     log.info(
         "调度: 每小时第 %02d 分 | 再入预警: <%d km | 数据日志: %s | 运行日志: %s | 缓存: %s",
@@ -709,13 +712,12 @@ def main() -> None:
         while True:
             # 首次运行时：如果没有缓存记录，立即执行；否则检查速率限制
             if first_run:
+                first_run = False  # 先置位，无论后续是否 continue 都不会重入
                 secs_since = cache.seconds_since_last_fetch()
                 if secs_since == float("inf"):
-                    # 从未请求过，跳过等待，立即执行
                     log.info("首次启动：无历史记录，将立即执行首次查询")
                     write_log_message("首次启动：无历史记录，立即执行首次查询")
                 elif secs_since < MIN_REQUEST_INTERVAL:
-                    # 距上次请求不足 1 小时，需要等待
                     wait_seconds = MIN_REQUEST_INTERVAL - secs_since
                     log.warning(
                         "首次启动：距上次请求仅 %.0f 分钟，需等待 %.0f 分钟以满足速率限制",
@@ -723,8 +725,6 @@ def main() -> None:
                     )
                     write_log_message(f"首次启动速率保护：需等待 {wait_seconds/60:.0f} 分钟")
                     time.sleep(wait_seconds)
-                # 如果 secs_since >= MIN_REQUEST_INTERVAL，无需等待
-                first_run = False
             else:
                 # 非首次运行，计算下次唤醒时间并等待
                 wake_at = compute_next_wake(cache, SCHEDULED_MINUTE)
