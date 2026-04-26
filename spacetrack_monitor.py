@@ -444,11 +444,11 @@ def _record_sort_key(rec: dict) -> tuple[datetime, int]:
     return (creation, file_no)
 
 
-def filter_by_norad(records: list[dict], norad_ids: list[int]) -> dict[int, list[dict]]:
+def filter_by_norad(records: list[dict], norad_ids: list[int]) -> dict[int, dict]:
     """
-    从批量结果中筛选目标 NORAD ID
-    返回每个卫星的所有记录（按 CREATION_DATE 排序）
-    这样可以保留完整的历史更新记录，用于趋势分析
+    筛选目标 NORAD ID，每个卫星只返回最新一条（CREATION_DATE 最大）。
+    同一小时内多条记录属于“解算修正覆盖”，不是轨道演化序列。
+    返回结构：{norad_id: latest_record_with_batch_count}
     """
     # 将目标列表转为集合，提高查找效率
     target_set = set(norad_ids)
@@ -464,15 +464,51 @@ def filter_by_norad(records: list[dict], norad_ids: list[int]) -> dict[int, list
             # 添加到对应卫星的记录列表
             grouped.setdefault(nid, []).append(rec)
 
-    # 对每个卫星的记录按时间排序（从旧到新）
-    found: dict[int, list[dict]] = {}
+    # 对每个卫星，只保留最新的一条记录
+    found: dict[int, dict] = {}
     for nid, recs in grouped.items():
-        # 使用模块级排序函数 _record_sort_key
-        found[nid] = sorted(recs, key=_record_sort_key)
+        # 按时间排序（从旧到新）
+        sorted_recs = sorted(recs, key=_record_sort_key)
+        latest = sorted_recs[-1]  # 取最后一条（最新）
+        
+        # 注入本批次记录数量，供 process_records 打日志用
+        latest["_batch_count"] = len(sorted_recs)
+        found[nid] = latest
+    
     return found
 
 
 # 轨道数据处理
+
+def classify_change(orbit: dict, prev: Optional[dict]) -> str:
+    """
+    粗略判断 TLE 变化是解算修正还是真实机动
+    判据：近地点/远地点变化幅度
+    - 解算误差通常在 2 km 以内
+    - 真实机动通常 > 5 km
+    """
+    if prev is None:
+        return "initial"  # 首次记录
+    
+    delta_peri = abs(orbit["periapsis"] - prev["periapsis"])
+    delta_apo = abs(orbit["apoapsis"] - prev["apoapsis"])
+    
+    # 如果近地点或远地点变化超过 5 km，判定为疑似机动
+    if delta_peri > 5.0 or delta_apo > 5.0:
+        return "maneuver"  # 疑似真实机动
+    
+    return "correction"  # 疑似解算修正
+
+
+def format_change_type(change_type: str) -> str:
+    """将变化类型转换为中英文对照格式"""
+    type_map = {
+        "initial": "首次记录 (Initial)",
+        "correction": "解算修正 (Correction)",
+        "maneuver": "真实机动 (Maneuver)",
+    }
+    return type_map.get(change_type, f"未知 ({change_type})")
+
 
 def parse_orbit(record: dict) -> dict:
     """从 Space-Track 记录中提取轨道参数并计算哈希值"""
@@ -565,12 +601,16 @@ def print_orbit(orbit: dict, prev: Optional[dict]) -> None:
         print(f"     注意：近地点 {peri:.1f} km，大气阻力明显，轨道将持续衰减")
 
 
-def log_record(orbit: dict) -> None:
+def log_record(orbit: dict, change_type: str = "unknown") -> None:
     """将轨道数据写入 DATA_LOG_FILE（最终数据文件）"""
     if not DATA_LOG_FILE:
         return
     rotate_file_if_needed(DATA_LOG_FILE)
-    entry = {"timestamp": datetime.now(timezone.utc).isoformat(), **orbit}
+    entry = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "change_type": change_type,  # 变化类型：initial/correction/maneuver
+        **orbit
+    }
     try:
         with open(DATA_LOG_FILE, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
@@ -625,61 +665,66 @@ def restore_from_log(norad_ids: list[int]) -> dict[int, dict]:
 # 数据处理
 
 def process_records(
-    raw_records: dict[int, list[dict]],
+    raw_records: dict[int, dict],
     prev_data: dict[int, dict],
     last_hash: dict[int, str],
     cache: LocalCache,
 ) -> None:
     """
     比对 TLE 哈希值，检测变化并记录日志
-    处理每个卫星的所有历史记录
+    每个卫星只处理最新一条记录（解算修正后的最终版）
     无论是否命中目标都更新缓存时间戳，防止速率保护卡死
     """
     # 遍历所有监控目标
     for norad_id in NORAD_IDS:
-        # 获取该卫星在本批次中的所有记录（已按时间排序）
-        record_list = raw_records.get(norad_id)
-        if not record_list:
+        # 获取该卫星的最新记录（已包含 _batch_count）
+        record = raw_records.get(norad_id)
+        if not record:
             # 本批次中没有该卫星的新 TLE
             msg = f"[{norad_id}] 本批次无数据（过去 1 小时内未发布新 TLE）"
             log.info(msg)
             write_log_message(msg)
             continue
 
-        # 获取上一次记录的轨道数据（用于计算变化量）
-        prev = prev_data.get(norad_id)  # 初始的上一条轨道数据
+        # 提取批次记录数（元数据，不进入 orbit）
+        batch_count = record.pop("_batch_count", 1)
         
-        # 处理该卫星的所有历史记录（同一小时内可能有多次更新）
-        for record in record_list:
-            # 解析轨道参数并计算 Hash
-            orbit = parse_orbit(record)
-            cur_hash = orbit["tle_hash"]
+        # 解析轨道参数并计算 Hash
+        orbit = parse_orbit(record)
+        prev = prev_data.get(norad_id)
+        cur_hash = orbit["tle_hash"]
 
-            # 检测 TLE 是否变化（与最新 Hash 比较）
-            if cur_hash != last_hash.get(norad_id):
-                # Hash 不同，说明轨道数据有更新
-                msg = f"[{norad_id}] 检测到 TLE 变化！(hash: {last_hash.get(norad_id, '无')} → {cur_hash})"
-                log.info(msg)
-                write_log_message(msg)
-                
-                # 打印轨道信息（显示与上一次的差异）
-                print_orbit(orbit, prev)
-                
-                # 写入数据日志文件（保留所有历史版本）
-                log_record(orbit)
-                
-                # 更新内存中的状态（供下次比较使用）
-                prev_data[norad_id] = orbit  # 更新最新轨道数据
-                last_hash[norad_id] = cur_hash  # 更新最新 Hash
-                prev = orbit  # 更新 prev，供下一条记录比较
-            elif not ONLY_PRINT_ON_UPDATE:
-                # Hash 相同，但配置为打印所有数据
-                print_orbit(orbit, None)  # TLE 未变化，不显示 delta
-            else:
-                # Hash 相同，且配置为仅打印变化，只记录日志
-                msg = f"[{norad_id}] {orbit['name']}：TLE 未变化（hash {cur_hash}）"
-                log.info(msg)
-                write_log_message(msg)
+        # 如果本批次有多条记录，记录日志
+        if batch_count > 1:
+            log.info("[%d] 本批次共 %d 条解算记录，取最新一条", norad_id, batch_count)
+
+        # 检测 TLE 是否变化（与最新 Hash 比较）
+        if cur_hash != last_hash.get(norad_id):
+            # 分类变化类型（解算修正 vs 真实机动）
+            change_type = classify_change(orbit, prev)
+            change_type_cn = format_change_type(change_type)  # 中英文对照
+            
+            msg = f"[{norad_id}] 检测到 TLE 变化！(hash: {last_hash.get(norad_id, '无')} → {cur_hash}, 类型: {change_type_cn})"
+            log.info(msg)
+            write_log_message(msg)
+            
+            # 打印轨道信息（显示与上一次的差异）
+            print_orbit(orbit, prev)
+            
+            # 写入数据日志文件（附带变化类型）
+            log_record(orbit, change_type)
+            
+            # 更新内存中的状态（供下次比较使用）
+            prev_data[norad_id] = orbit  # 更新最新轨道数据
+            last_hash[norad_id] = cur_hash  # 更新最新 Hash
+        elif not ONLY_PRINT_ON_UPDATE:
+            # Hash 相同，但配置为打印所有数据
+            print_orbit(orbit, None)  # TLE 未变化，不显示 delta
+        else:
+            # Hash 相同，且配置为仅打印变化，只记录日志
+            msg = f"[{norad_id}] {orbit['name']}：TLE 未变化（hash {cur_hash}）"
+            log.info(msg)
+            write_log_message(msg)
 
     # 更新缓存时间戳（全量数据已在 save_raw_records 中保存）
     # 即使没有命中目标，也要更新时间戳，避免下次启动时重复请求
@@ -712,6 +757,14 @@ def main() -> None:
     # 加载缓存
     cache = LocalCache(CACHE_FILE)
 
+    # 从数据日志恢复历史轨道状态（必须在断点恢夏之前）
+    prev_data = restore_from_log(NORAD_IDS)
+
+    # 初始化哈希字典，用于检测 TLE 变化
+    last_hash: dict[int, str] = {
+        nid: orbit.get("tle_hash", "") for nid, orbit in prev_data.items()
+    }
+
     # 检查是否有待处理的数据（断点恢复）
     if cache.has_pending_data:
         log.info("检测到未处理的全量数据，尝试断点恢复...")
@@ -740,14 +793,6 @@ def main() -> None:
         else:
             log.warning("缓存中有待处理标记，但无实际数据")
 
-    # 从数据日志恢复历史轨道状态
-    prev_data = restore_from_log(NORAD_IDS)
-
-    # 初始化哈希字典，用于检测 TLE 变化
-    last_hash: dict[int, str] = {
-        nid: orbit.get("tle_hash", "") for nid, orbit in prev_data.items()
-    }
-
     # 打印当前轨道状态
     for norad_id in NORAD_IDS:
         orbit = prev_data.get(norad_id)
@@ -761,14 +806,14 @@ def main() -> None:
             # === 确定是否需要等待 ===
             if first_run:
                 # 首次启动：检查距上次请求的时间
-                first_run = False  # 先置位，无论后续是否 continue 都不会重入
+                first_run = False
                 secs_since = cache.seconds_since_last_fetch()
                 if secs_since == float("inf"):
                     # 从未请求过，立即执行首次查询
                     log.info("首次启动：无历史记录，将立即执行首次查询")
                     write_log_message("首次启动：无历史记录，立即执行首次查询")
                 elif secs_since < MIN_REQUEST_INTERVAL:
-                    # 距上次请求不足 1 小时，需要等待以满足速率限制
+                    # 距上次请求不足 1 小时，需要等待
                     wait_seconds = MIN_REQUEST_INTERVAL - secs_since
                     log.warning(
                         "首次启动：距上次请求仅 %.0f 分钟，需等待 %.0f 分钟以满足速率限制",
