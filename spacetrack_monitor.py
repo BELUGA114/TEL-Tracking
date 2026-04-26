@@ -93,7 +93,7 @@ log = logging.getLogger(__name__)
 
 
 def rotate_file_if_needed(filepath: str, max_size: int = MAX_LOG_SIZE) -> None:
-    """如果文件超过 max_size，将其重命名为 .bak 实现轮转。"""
+    """如果文件超过 max_size，将其重命名为 .bak 实现轮转"""
     try:
         if os.path.exists(filepath) and os.path.getsize(filepath) > max_size:
             backup = filepath + ".bak"
@@ -107,7 +107,7 @@ def rotate_file_if_needed(filepath: str, max_size: int = MAX_LOG_SIZE) -> None:
 
 
 def parse_datetime_utc(value: object) -> Optional[datetime]:
-    """将 Space-Track 返回的 ISO 时间字符串转换为 UTC datetime 对象。"""
+    """将 Space-Track 返回的 ISO 时间字符串转换为 UTC datetime 对象"""
     if not value or not isinstance(value, str):
         return None
     try:
@@ -123,7 +123,7 @@ def parse_datetime_utc(value: object) -> Optional[datetime]:
 # 本地缓存管理
 
 class LocalCache:
-    """持久化缓存，保存上次请求时间和 TLE 数据。"""
+    """持久化缓存，保存上次请求时间和 TLE 数据"""
 
     def __init__(self, path: str) -> None:
         self._path = path
@@ -132,7 +132,7 @@ class LocalCache:
             self._load()
 
     def _load(self) -> None:
-        """从 JSON 文件加载缓存数据。"""
+        """从 JSON 文件加载缓存数据"""
         try:
             with open(self._path, "r", encoding="utf-8") as f:
                 raw = json.load(f)
@@ -149,7 +149,7 @@ class LocalCache:
             log.warning("缓存加载失败（将从头开始）: %s", e)
 
     def _save(self) -> None:
-        """将缓存数据保存到 JSON 文件。"""
+        """将缓存数据保存到 JSON 文件"""
         if not self._path:
             return
         try:
@@ -160,7 +160,7 @@ class LocalCache:
 
     @property
     def last_fetch_ts(self) -> Optional[datetime]:
-        """获取上次请求的时间戳。"""
+        """获取上次请求的时间戳"""
         ts = parse_datetime_utc(self._data.get("last_fetch_ts"))
         if ts is None:
             raw = self._data.get("last_fetch_ts")
@@ -169,30 +169,30 @@ class LocalCache:
         return ts
 
     def seconds_since_last_fetch(self) -> float:
-        """计算距离上次请求的秒数。"""
+        """计算距离上次请求的秒数"""
         ts = self.last_fetch_ts
         if ts is None:
             return float("inf")  # 从未请求过，返回无穷大
         return (datetime.now(timezone.utc) - ts).total_seconds()
 
     def get_orbit(self, norad_id: int) -> Optional[dict]:
-        """获取指定 NORAD ID 的轨道数据。"""
+        """获取指定 NORAD ID 的轨道数据"""
         return self._data["tle_data"].get(str(norad_id))
 
     def mark_fetched(self) -> None:
-        """更新请求时间戳（请求成功但无命中目标时使用）。"""
+        """更新请求时间戳（请求成功但无命中目标时使用）"""
         self._data["last_fetch_ts"] = datetime.now(timezone.utc).isoformat()
         self._save()
 
     def update(self, orbits: dict[int, dict]) -> None:
-        """更新请求时间戳和 TLE 数据。"""
+        """更新请求时间戳和 TLE 数据"""
         self._data["last_fetch_ts"] = datetime.now(timezone.utc).isoformat()
         for norad_id, orbit in orbits.items():
             self._data["tle_data"][str(norad_id)] = orbit
         self._save()
 
     def all_cached_orbits(self) -> dict[int, dict]:
-        """获取所有缓存的轨道数据。"""
+        """获取所有缓存的轨道数据"""
         result: dict[int, dict] = {}
         for k, v in self._data.get("tle_data", {}).items():
             try:
@@ -205,7 +205,7 @@ class LocalCache:
 # 调度器
 
 def next_scheduled_time(minute: int = SCHEDULED_MINUTE) -> datetime:
-    """计算下一个调度时刻（每小时的 :MM 分）。"""
+    """计算下一个调度时刻（每小时的 :MM 分）"""
     now = datetime.now(timezone.utc)
     target = now.replace(minute=minute, second=0, microsecond=0)
     # 如果当前时间已超过目标时间，则推到下一小时
@@ -215,7 +215,7 @@ def next_scheduled_time(minute: int = SCHEDULED_MINUTE) -> datetime:
 
 
 def wait_until(target: datetime) -> None:
-    """阻塞等待到指定时刻（每分钟唤醒一次，便于响应 Ctrl-C）。"""
+    """阻塞等待到指定时刻（每分钟唤醒一次，便于响应 Ctrl-C）"""
     while True:
         secs = (target - datetime.now(timezone.utc)).total_seconds()
         if secs <= 0:
@@ -233,7 +233,7 @@ def compute_next_wake(cache: LocalCache, minute: int = SCHEDULED_MINUTE) -> date
     计算下次唤醒时间，同时满足两个约束：
     1. 下一个调度时刻（每小时的 :MM 分）
     2. 距上次请求满 MIN_REQUEST_INTERVAL（3600秒）
-    取两者中较晚的时刻。
+    取两者中较晚的时刻
     """
     sched = next_scheduled_time(minute)
 
@@ -259,13 +259,13 @@ def compute_next_wake(cache: LocalCache, minute: int = SCHEDULED_MINUTE) -> date
 # Space-Track 会话管理
 
 class FetchStatus(Enum):
-    """请求状态枚举。"""
+    """请求状态枚举"""
     RELOGIN = auto()  # 401 错误，需要重新登录
     SKIP = auto()     # 临时错误，本轮跳过
 
 
 class SpaceTrackSession:
-    """封装 Space-Track 登录、重试和会话管理逻辑。"""
+    """封装 Space-Track 登录、重试和会话管理逻辑"""
 
     def __init__(self) -> None:
         self._session = requests.Session()
@@ -286,7 +286,7 @@ class SpaceTrackSession:
         return True
 
     def login_once(self) -> bool:
-        """尝试登录一次，成功返回 True。"""
+        """尝试登录一次，成功返回 True"""
         try:
             resp = self._session.post(
                 LOGIN_URL,
@@ -311,7 +311,7 @@ class SpaceTrackSession:
         return False
 
     def login_with_retry(self) -> bool:
-        """带重试的登录，最多尝试 LOGIN_MAX_FAILURES 次。"""
+        """带重试的登录，最多尝试 LOGIN_MAX_FAILURES 次"""
         for attempt in range(1, LOGIN_MAX_FAILURES + 1):
             if self.login_once():
                 return True
@@ -333,7 +333,7 @@ class SpaceTrackSession:
         return False
 
     def ensure_fresh_session(self) -> bool:
-        """确保会话有效，如果超过 SESSION_MAX_AGE 则重新登录。"""
+        """确保会话有效，如果超过 SESSION_MAX_AGE 则重新登录"""
         if self._logged_in_at is None:
             return self.login_with_retry()
         age = time.monotonic() - self._logged_in_at
@@ -358,7 +358,7 @@ class SpaceTrackSession:
         return self.login_with_retry()
 
     def get(self, url: str) -> "requests.Response | FetchStatus":
-        """发送 GET 请求，带重试和错误处理。"""
+        """发送 GET 请求，带重试和错误处理"""
         for attempt in range(1, REQUEST_MAX_RETRIES + 1):
             try:
                 resp = self._session.get(url, timeout=30)
@@ -394,7 +394,7 @@ class SpaceTrackSession:
 # 批量拉取和本地筛选
 
 def fetch_bulk_tle(st: SpaceTrackSession) -> "list[dict] | FetchStatus":
-    """批量拉取最近 1 小时内发布的所有 TLE（消耗 1 次 gp 配额）。"""
+    """批量拉取最近 1 小时内发布的所有 TLE（消耗 1 次 gp 配额）"""
     log.info("请求批量 TLE（最近 1 小时发布）...")
     result = st.get(BULK_TLE_URL)
     if isinstance(result, FetchStatus):
@@ -409,7 +409,7 @@ def fetch_bulk_tle(st: SpaceTrackSession) -> "list[dict] | FetchStatus":
 
 
 def fetch_bulk_with_relogin(st: SpaceTrackSession) -> Optional[list[dict]]:
-    """带重登录保护的批量拉取，如果会话过期会自动重新登录。"""
+    """带重登录保护的批量拉取，如果会话过期会自动重新登录"""
     result = fetch_bulk_tle(st)
     if result is FetchStatus.RELOGIN:
         log.info("会话过期，重新登录...")
@@ -421,10 +421,11 @@ def fetch_bulk_with_relogin(st: SpaceTrackSession) -> Optional[list[dict]]:
     return result
 
 
-def filter_by_norad(records: list[dict], norad_ids: list[int]) -> dict[int, dict]:
+def filter_by_norad(records: list[dict], norad_ids: list[int]) -> dict[int, list[dict]]:
     """
-    从批量结果中筛选目标 NORAD ID。
-    如果同一卫星有多条记录，优先保留最新的（按 CREATION_DATE、EPOCH、FILE 排序）。
+    从批量结果中筛选目标 NORAD ID
+    返回每个卫星的所有记录（按 CREATION_DATE 排序）
+    这样可以保留完整的历史更新记录，用于趋势分析
     """
     target_set = set(norad_ids)
     grouped: dict[int, list[dict]] = {}
@@ -436,9 +437,9 @@ def filter_by_norad(records: list[dict], norad_ids: list[int]) -> dict[int, dict
         if nid in target_set:
             grouped.setdefault(nid, []).append(rec)
 
-    found: dict[int, dict] = {}
+    # 对每个卫星的记录按时间排序（从旧到新）
+    found: dict[int, list[dict]] = {}
     for nid, recs in grouped.items():
-        # 定义排序规则：优先 CREATION_DATE，其次 EPOCH，最后 FILE 号
         def sort_key(rec: dict) -> tuple[datetime, datetime, int]:
             creation = parse_datetime_utc(rec.get("CREATION_DATE")) or datetime.min.replace(tzinfo=timezone.utc)
             epoch = parse_datetime_utc(rec.get("EPOCH")) or datetime.min.replace(tzinfo=timezone.utc)
@@ -448,14 +449,15 @@ def filter_by_norad(records: list[dict], norad_ids: list[int]) -> dict[int, dict
                 file_no = 0
             return (creation, epoch, file_no)
 
-        found[nid] = max(recs, key=sort_key)
+        # 按时间排序，保留所有记录
+        found[nid] = sorted(recs, key=sort_key)
     return found
 
 
 # 轨道数据处理
 
 def parse_orbit(record: dict) -> dict:
-    """从 Space-Track 记录中提取轨道参数并计算哈希值。"""
+    """从 Space-Track 记录中提取轨道参数并计算哈希值"""
     name = (record.get("OBJECT_NAME") or "").strip()
     tle1 = str(record.get("TLE_LINE1") or "")
     tle2 = str(record.get("TLE_LINE2") or "")
@@ -480,8 +482,8 @@ def parse_orbit(record: dict) -> dict:
 
 def estimate_reentry_days(orbit: dict) -> Optional[float]:
     """
-    基于 BSTAR 和简化大气模型估算剩余再入天数（仅供参考）。
-    原理：通过大气阻力引起的平均运动变化率推算轨道衰减速度。
+    基于 BSTAR 和简化大气模型估算剩余再入天数（仅供参考）
+    原理：通过大气阻力引起的平均运动变化率推算轨道衰减速度
     """
     peri, bstar, period = orbit["periapsis"], orbit["bstar"], orbit["period"]
     # 近地点过高或 BSTAR 无效时无法估算
@@ -513,7 +515,7 @@ def format_reentry_estimate(days: float) -> str:
 
 
 def print_orbit(orbit: dict, prev: Optional[dict]) -> None:
-    """格式化打印轨道信息。"""
+    """格式化打印轨道信息"""
     peri, apo = orbit["periapsis"], orbit["apoapsis"]
     delta = ""
     if prev:
@@ -546,7 +548,7 @@ def print_orbit(orbit: dict, prev: Optional[dict]) -> None:
 
 
 def log_record(orbit: dict) -> None:
-    """将轨道数据写入 DATA_LOG_FILE（最终数据文件）。"""
+    """将轨道数据写入 DATA_LOG_FILE（最终数据文件）"""
     if not DATA_LOG_FILE:
         return
     rotate_file_if_needed(DATA_LOG_FILE)
@@ -559,7 +561,7 @@ def log_record(orbit: dict) -> None:
 
 
 def write_log_message(message: str) -> None:
-    """将运行日志写入 LOG_FILE。"""
+    """将运行日志写入 LOG_FILE"""
     if not LOG_FILE:
         return
     rotate_file_if_needed(LOG_FILE)
@@ -574,7 +576,7 @@ def write_log_message(message: str) -> None:
 # 状态恢复
 
 def restore_from_log(norad_ids: list[int]) -> dict[int, dict]:
-    """从 DATA_LOG_FILE 恢复历史轨道状态。"""
+    """从 DATA_LOG_FILE 恢复历史轨道状态"""
     prev_data: dict[int, dict] = {}
     if not DATA_LOG_FILE:
         return prev_data
@@ -605,48 +607,52 @@ def restore_from_log(norad_ids: list[int]) -> dict[int, dict]:
 # 数据处理
 
 def process_records(
-    raw_records: dict[int, dict],
+    raw_records: dict[int, list[dict]],
     prev_data: dict[int, dict],
     last_hash: dict[int, str],
     cache: LocalCache,
 ) -> None:
     """
-    比对 TLE 哈希值，检测变化并记录日志。
-    无论是否命中目标都更新缓存时间戳，防止速率保护卡死。
+    比对 TLE 哈希值，检测变化并记录日志
+    处理每个卫星的所有历史记录
+    无论是否命中目标都更新缓存时间戳，防止速率保护卡死
     """
     updated_orbits: dict[int, dict] = {}
 
     for norad_id in NORAD_IDS:
-        record = raw_records.get(norad_id)
-        if record is None:
+        record_list = raw_records.get(norad_id)
+        if not record_list:
             msg = f"[{norad_id}] 本批次无数据（过去 1 小时内未发布新 TLE）"
             log.info(msg)
             write_log_message(msg)
             continue
 
-        orbit = parse_orbit(record)
-        prev = prev_data.get(norad_id)
-        cur_hash = orbit["tle_hash"]
+        # 处理该卫星的所有历史记录
+        for record in record_list:
+            orbit = parse_orbit(record)
+            prev = prev_data.get(norad_id)
+            cur_hash = orbit["tle_hash"]
 
-        # 检测 TLE 是否变化
-        if cur_hash != last_hash.get(norad_id):
-            msg = f"[{norad_id}] 检测到 TLE 变化！(hash: {last_hash.get(norad_id, '无')} → {cur_hash})"
-            log.info(msg)
-            write_log_message(msg)
-            print_orbit(orbit, prev)
-            log_record(orbit)
-            prev_data[norad_id] = orbit
-            last_hash[norad_id] = cur_hash
-        elif not ONLY_PRINT_ON_UPDATE:
-            print_orbit(orbit, prev)
-        else:
-            msg = f"[{norad_id}] {orbit['name']}：TLE 未变化（hash {cur_hash}）"
-            log.info(msg)
-            write_log_message(msg)
+            # 检测 TLE 是否变化
+            if cur_hash != last_hash.get(norad_id):
+                msg = f"[{norad_id}] 检测到 TLE 变化！(hash: {last_hash.get(norad_id, '无')} → {cur_hash})"
+                log.info(msg)
+                write_log_message(msg)
+                print_orbit(orbit, prev)
+                log_record(orbit)
+                prev_data[norad_id] = orbit
+                last_hash[norad_id] = cur_hash
+            elif not ONLY_PRINT_ON_UPDATE:
+                print_orbit(orbit, prev)
+            else:
+                msg = f"[{norad_id}] {orbit['name']}：TLE 未变化（hash {cur_hash}）"
+                log.info(msg)
+                write_log_message(msg)
 
-        updated_orbits[norad_id] = orbit
+            # 更新为最新的轨道数据
+            updated_orbits[norad_id] = orbit
 
-    # 更新缓存
+    # 更新缓存（只保存每个卫星的最新状态）
     if updated_orbits:
         cache.update(updated_orbits)
     else:
@@ -656,7 +662,7 @@ def process_records(
 # 主程序
 
 def main() -> None:
-    """主函数：启动 TLE 监控循环。"""
+    """主函数：启动 TLE 监控循环"""
     # 检查凭据
     if not USERNAME or not PASSWORD:
         log.error("缺少 Space-Track 凭据！")
