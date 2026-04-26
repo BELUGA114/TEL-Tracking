@@ -130,7 +130,7 @@ class LocalCache:
 
     def __init__(self, path: str) -> None:
         self._path = path
-        self._data: dict = {"last_fetch_ts": None, "raw_records": []}
+        self._data: dict = {"last_fetch_ts": None, "raw_records": [], "pending": False}
         if path:
             self._load()
 
@@ -147,6 +147,8 @@ class LocalCache:
                 log.warning("缓存 raw_records 字段类型异常，已重置")
                 raw_records = []
             self._data["raw_records"] = raw_records
+            # 加载待处理标记（用于断点恢复）
+            self._data["pending"] = raw.get("pending", False)
             log.info("已加载本地缓存：%s", self._path)
         except (OSError, json.JSONDecodeError, ValueError) as e:
             log.warning("缓存加载失败（将从头开始）: %s", e)
@@ -184,10 +186,25 @@ class LocalCache:
         self._save()
 
     def save_raw_records(self, records: list[dict]) -> None:
-        """保存全量原始记录（覆盖旧数据）"""
+        """保存全量原始记录（覆盖旧数据），并标记为待处理"""
         self._data["last_fetch_ts"] = datetime.now(timezone.utc).isoformat()
         self._data["raw_records"] = records
+        self._data["pending"] = True  # 标记有未处理的数据
         self._save()
+
+    def clear_pending(self) -> None:
+        """清除待处理标记（数据处理完成后调用）"""
+        self._data["pending"] = False
+        self._save()
+
+    @property
+    def has_pending_data(self) -> bool:
+        """检查是否有待处理的全量数据（用于断点恢复）"""
+        return self._data.get("pending", False)
+
+    def get_raw_records(self) -> list[dict]:
+        """获取缓存中的全量原始记录"""
+        return self._data.get("raw_records", [])
 
 
 # 调度器
@@ -401,13 +418,17 @@ def fetch_bulk_tle(st: SpaceTrackSession) -> "list[dict] | FetchStatus":
 
 
 def fetch_bulk_with_relogin(st: SpaceTrackSession) -> Optional[list[dict]]:
-    """带重登录保护的批量拉取，如果会话过期会自动重新登录"""
+    """
+    带重登录保护的批量拉取
+    如果遇到 401 错误，重新登录后不会立即重试 gp 请求
+    而是返回 None，由主循环在下一个调度周期再试
+    """
     result = fetch_bulk_tle(st)
     if result is FetchStatus.RELOGIN:
+        # 会话过期，重新登录后不立即重试（避免同一小时内第 2 次 gp 请求）
         log.info("会话过期，重新登录...")
-        if not st.relogin():
-            return None
-        result = fetch_bulk_tle(st)
+        st.relogin()
+        return None
     if isinstance(result, FetchStatus):
         return None
     return result
@@ -691,6 +712,34 @@ def main() -> None:
     # 加载缓存
     cache = LocalCache(CACHE_FILE)
 
+    # 检查是否有待处理的数据（断点恢复）
+    if cache.has_pending_data:
+        log.info("检测到未处理的全量数据，尝试断点恢复...")
+        write_log_message("检测到未处理数据，进行断点恢复")
+        
+        # 从缓存中获取全量原始数据
+        all_records = cache.get_raw_records()
+        if all_records:
+            # 筛选目标卫星
+            raw_records = filter_by_norad(all_records, NORAD_IDS)
+            found_ids = list(raw_records.keys())
+            missing_ids = [nid for nid in NORAD_IDS if nid not in raw_records]
+            
+            if found_ids:
+                log.info("断点恢复：筛选命中 %s", ', '.join(str(i) for i in found_ids))
+            if missing_ids:
+                log.info("断点恢复：本批次未包含 %s", ', '.join(str(i) for i in missing_ids))
+            
+            # 处理记录
+            process_records(raw_records, prev_data, last_hash, cache)
+            
+            # 清除待处理标记
+            cache.clear_pending()
+            log.info("断点恢复完成")
+            write_log_message("断点恢复完成")
+        else:
+            log.warning("缓存中有待处理标记，但无实际数据")
+
     # 从数据日志恢复历史轨道状态
     prev_data = restore_from_log(NORAD_IDS)
 
@@ -778,6 +827,9 @@ def main() -> None:
 
             # === 处理记录，Hash 比对，写入日志 ===
             process_records(raw_records, prev_data, last_hash, cache)
+            
+            # 处理完成，清除待处理标记
+            cache.clear_pending()
 
 
 if __name__ == "__main__":
