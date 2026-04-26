@@ -52,8 +52,9 @@ NORAD_IDS: list[int] = [68765, 25544]
 # 每小时请求的分钟数（建议 12 或 48，避开整点/半点高峰）
 SCHEDULED_MINUTE = 12
 
-LOG_FILE = "tle_log.jsonl"
-CACHE_FILE = "tle_cache.json"
+DATA_LOG_FILE = "tle_data.jsonl"  # 最终轨道数据（带轮转）
+CACHE_FILE = "tle_cache.json"      # 临时缓存，自动覆盖
+LOG_FILE = "tle_log.jsonl"         # 运行日志（带轮转）
 REENTRY_WARNING_KM = 200
 ONLY_PRINT_ON_UPDATE = True
 
@@ -68,7 +69,9 @@ MIN_REQUEST_INTERVAL = 3600  # 速率保护：两次请求最小间隔（秒）
 # Space-Track 会话最长有效期（秒）；保守取 90 分钟
 SESSION_MAX_AGE = 5400
 
-# ╚══════════════════════════════════════════════════════╝
+# 日志文件最大大小（字节），超过后自动轮转（10 MB）
+MAX_LOG_SIZE = 10 * 1024 * 1024
+
 
 BASE_URL = "https://www.space-track.org"
 LOGIN_URL = f"{BASE_URL}/ajaxauth/login"
@@ -86,6 +89,20 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger(__name__)
+
+
+def rotate_file_if_needed(filepath: str, max_size: int = MAX_LOG_SIZE) -> None:
+    """如果文件超过 max_size，将其重命名为 .bak。"""
+    try:
+        if os.path.exists(filepath) and os.path.getsize(filepath) > max_size:
+            backup = filepath + ".bak"
+            # 如果备份已存在，先删除旧备份
+            if os.path.exists(backup):
+                os.remove(backup)
+            os.rename(filepath, backup)
+            log.info("   日志文件 %s 已轮转（>%d MB）", filepath, max_size // (1024 * 1024))
+    except OSError as e:
+        log.error("   日志轮转失败: %s", e)
 
 
 # ── 本地缓存 ──────────────────────────────────────────────
@@ -175,7 +192,7 @@ def next_scheduled_time(minute: int = SCHEDULED_MINUTE) -> datetime:
     """
     now = datetime.now(timezone.utc)
     target = now.replace(minute=minute, second=0, microsecond=0)
-    if now > target + timedelta(seconds=30):
+    while target <= now:
         target += timedelta(hours=1)
     return target
 
@@ -290,6 +307,7 @@ class SpaceTrackSession:
                     LOGIN_MAX_FAILURES,
                     LOGIN_PAUSE_SECONDS // 60,
                 )
+                time.sleep(LOGIN_PAUSE_SECONDS)
         return False
 
     def ensure_fresh_session(self) -> bool:
@@ -477,24 +495,40 @@ def print_orbit(orbit: dict, prev: Optional[dict]) -> None:
 
 
 def log_record(orbit: dict) -> None:
+    """将轨道数据写入 DATA_LOG_FILE（最终数据）。"""
+    if not DATA_LOG_FILE:
+        return
+    rotate_file_if_needed(DATA_LOG_FILE)
+    entry = {"timestamp": datetime.now(timezone.utc).isoformat(), **orbit}
+    try:
+        with open(DATA_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except OSError as e:
+        log.error("   数据日志写入失败: %s", e)
+
+
+def write_log_message(message: str) -> None:
+    """将运行日志写入 LOG_FILE。"""
     if not LOG_FILE:
         return
-    entry = {"timestamp": datetime.now(timezone.utc).isoformat(), **orbit}
+    rotate_file_if_needed(LOG_FILE)
+    entry = {"timestamp": datetime.now(timezone.utc).isoformat(), "message": message}
     try:
         with open(LOG_FILE, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
     except OSError as e:
-        log.error("   日志写入失败: %s", e)
+        log.error("   运行日志写入失败: %s", e)
 
 
 # ── 状态恢复（兼容旧版 JSONL 日志） ─────────────────────────
 
 def restore_from_log(norad_ids: list[int]) -> dict[int, dict]:
+    """从 DATA_LOG_FILE 恢复历史状态（而非 LOG_FILE）。"""
     prev_data: dict[int, dict] = {}
-    if not LOG_FILE:
+    if not DATA_LOG_FILE:
         return prev_data
     try:
-        with open(LOG_FILE, "r", encoding="utf-8") as f:
+        with open(DATA_LOG_FILE, "r", encoding="utf-8") as f:
             lines = f.readlines()
     except OSError:
         return prev_data
@@ -512,7 +546,7 @@ def restore_from_log(norad_ids: list[int]) -> dict[int, dict]:
         if len(seen) == len(norad_ids):
             break
     if prev_data:
-        log.info("   已从日志恢复 %d 个目标的历史状态", len(prev_data))
+        log.info("   已从数据日志恢复 %d 个目标的历史状态", len(prev_data))
     return prev_data
 
 
@@ -525,7 +559,7 @@ def process_records(
     cache: LocalCache,
 ) -> None:
     """
-    比对哈希、打印变化、写日志。
+    比对哈希、打印变化、写数据日志。
     无论是否命中都推进时间戳，防止速率保护卡死。
     """
     updated_orbits: dict[int, dict] = {}
@@ -533,7 +567,9 @@ def process_records(
     for norad_id in NORAD_IDS:
         record = raw_records.get(norad_id)
         if record is None:
-            log.info("   — [%d] 本批次无数据（过去 1 小时内未发布新 TLE）", norad_id)
+            msg = f"   — [{norad_id}] 本批次无数据（过去 1 小时内未发布新 TLE）"
+            log.info(msg)
+            write_log_message(msg)
             continue
 
         orbit = parse_orbit(record)
@@ -541,10 +577,9 @@ def process_records(
         cur_hash = orbit["tle_hash"]
 
         if cur_hash != last_hash.get(norad_id):
-            log.info(
-                "   [%d] 检测到 TLE 变化！(hash: %s → %s)",
-                norad_id, last_hash.get(norad_id, "无"), cur_hash,
-            )
+            msg = f"   [{norad_id}] 检测到 TLE 变化！(hash: {last_hash.get(norad_id, '无')} → {cur_hash})"
+            log.info(msg)
+            write_log_message(msg)
             print_orbit(orbit, prev)
             log_record(orbit)
             prev_data[norad_id] = orbit
@@ -552,7 +587,9 @@ def process_records(
         elif not ONLY_PRINT_ON_UPDATE:
             print_orbit(orbit, prev)
         else:
-            log.info("   — [%d] %s：TLE 未变化（hash %s）", norad_id, orbit["name"], cur_hash)
+            msg = f"   — [{norad_id}] {orbit['name']}：TLE 未变化（hash {cur_hash}）"
+            log.info(msg)
+            write_log_message(msg)
 
         updated_orbits[norad_id] = orbit
 
@@ -565,12 +602,18 @@ def process_records(
 # ── 主循环 ────────────────────────────────────────────────
 
 def main() -> None:
+    """显式检查凭据"""
+    if not USERNAME or not PASSWORD:
+        log.error("❌ 缺少 Space-Track 凭据！")
+        log.error("   请在 .env 文件中设置 SPACETRACK_USER 和 SPACETRACK_PASS")
+        raise SystemExit(1)
+
     log.info("🛰  Space-Track 轨道监控（合规版）")
     log.info("   目标: %s", ", ".join(str(i) for i in NORAD_IDS))
     log.info(
-        "   调度: 每小时第 %02d 分  |  再入预警: <%d km  |  日志: %s  |  缓存: %s",
+        "   调度: 每小时第 %02d 分  |  再入预警: <%d km  |  数据日志: %s  |  运行日志: %s  |  缓存: %s",
         SCHEDULED_MINUTE, REENTRY_WARNING_KM,
-        LOG_FILE or "关闭", CACHE_FILE or "关闭",
+        DATA_LOG_FILE or "关闭", LOG_FILE or "关闭", CACHE_FILE or "关闭",
     )
     print()
 
@@ -593,20 +636,40 @@ def main() -> None:
             print_orbit(orbit, None)
 
     with SpaceTrackSession() as st:
+        first_run = True
         while True:
+            # 首次运行时也需遵守速率保护
+            if first_run:
+                secs_since = cache.seconds_since_last_fetch()
+                if secs_since < MIN_REQUEST_INTERVAL:
+                    wait_seconds = MIN_REQUEST_INTERVAL - secs_since
+                    log.warning(
+                        "   首次启动：距上次请求仅 %.0f 分钟，需等待 %.0f 分钟以满足速率限制",
+                        secs_since / 60, wait_seconds / 60
+                    )
+                    write_log_message(f"首次启动速率保护：需等待 {wait_seconds/60:.0f} 分钟")
+                    time.sleep(wait_seconds)
+                first_run = False
+
             wake_at = compute_next_wake(cache, SCHEDULED_MINUTE)
             wait_until(wake_at)
 
             now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-            log.info("   [%s] 开始批量拉取...", now_str)
+            msg = f"   [{now_str}] 开始批量拉取..."
+            log.info(msg)
+            write_log_message(msg)
 
             if not st.ensure_fresh_session():
-                log.error("   登录失败，等待下一个调度周期")
+                msg = "   登录失败，等待下一个调度周期"
+                log.error(msg)
+                write_log_message(msg)
                 continue
 
             all_records = fetch_bulk_with_relogin(st)
             if all_records is None:
-                log.error("   本次拉取失败，等待下一个调度周期")
+                msg = "   本次拉取失败，等待下一个调度周期"
+                log.error(msg)
+                write_log_message(msg)
                 continue
 
             raw_records = filter_by_norad(all_records, NORAD_IDS)
@@ -614,10 +677,13 @@ def main() -> None:
             missing_ids = [nid for nid in NORAD_IDS if nid not in raw_records]
 
             if found_ids:
-                log.info("   筛选命中：%s", ", ".join(str(i) for i in found_ids))
+                msg = f"   筛选命中：{', '.join(str(i) for i in found_ids)}"
+                log.info(msg)
+                write_log_message(msg)
             if missing_ids:
-                log.info("   本批次未包含（过去 1 小时内无新 TLE）：%s",
-                         ", ".join(str(i) for i in missing_ids))
+                msg = f"   本批次未包含（过去 1 小时内无新 TLE）：{', '.join(str(i) for i in missing_ids)}"
+                log.info(msg)
+                write_log_message(msg)
 
             process_records(raw_records, prev_data, last_hash, cache)
 
