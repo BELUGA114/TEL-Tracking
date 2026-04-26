@@ -126,11 +126,11 @@ def parse_datetime_utc(value: object) -> Optional[datetime]:
 # 本地缓存管理
 
 class LocalCache:
-    """持久化缓存，保存上次请求时间和 TLE 数据"""
+    """持久化缓存，保存上次请求时间和全量原始 TLE 数据"""
 
     def __init__(self, path: str) -> None:
         self._path = path
-        self._data: dict = {"last_fetch_ts": None, "tle_data": {}}
+        self._data: dict = {"last_fetch_ts": None, "raw_records": []}
         if path:
             self._load()
 
@@ -142,17 +142,17 @@ class LocalCache:
             if not isinstance(raw, dict):
                 raise ValueError("缓存格式错误")
             self._data["last_fetch_ts"] = raw.get("last_fetch_ts", None)
-            tle_data = raw.get("tle_data", {})
-            if not isinstance(tle_data, dict):
-                log.warning("缓存 tle_data 字段类型异常，已重置")
-                tle_data = {}
-            self._data["tle_data"] = tle_data
+            raw_records = raw.get("raw_records", [])
+            if not isinstance(raw_records, list):
+                log.warning("缓存 raw_records 字段类型异常，已重置")
+                raw_records = []
+            self._data["raw_records"] = raw_records
             log.info("已加载本地缓存：%s", self._path)
         except (OSError, json.JSONDecodeError, ValueError) as e:
             log.warning("缓存加载失败（将从头开始）: %s", e)
 
     def _save(self) -> None:
-        """将缓存数据保存到 JSON 文件"""
+        """将缓存数据保存到 JSON 文件（覆盖模式）"""
         if not self._path:
             return
         try:
@@ -178,31 +178,16 @@ class LocalCache:
             return float("inf")  # 从未请求过，返回无穷大
         return (datetime.now(timezone.utc) - ts).total_seconds()
 
-    def get_orbit(self, norad_id: int) -> Optional[dict]:
-        """获取指定 NORAD ID 的轨道数据"""
-        return self._data["tle_data"].get(str(norad_id))
-
     def mark_fetched(self) -> None:
-        """更新请求时间戳（请求成功但无命中目标时使用）"""
+        """更新请求时间戳（请求成功时使用）"""
         self._data["last_fetch_ts"] = datetime.now(timezone.utc).isoformat()
         self._save()
 
-    def update(self, orbits: dict[int, dict]) -> None:
-        """更新请求时间戳和 TLE 数据"""
+    def save_raw_records(self, records: list[dict]) -> None:
+        """保存全量原始记录（覆盖旧数据）"""
         self._data["last_fetch_ts"] = datetime.now(timezone.utc).isoformat()
-        for norad_id, orbit in orbits.items():
-            self._data["tle_data"][str(norad_id)] = orbit
+        self._data["raw_records"] = records
         self._save()
-
-    def all_cached_orbits(self) -> dict[int, dict]:
-        """获取所有缓存的轨道数据"""
-        result: dict[int, dict] = {}
-        for k, v in self._data.get("tle_data", {}).items():
-            try:
-                result[int(k)] = v
-            except (ValueError, TypeError):
-                log.warning("缓存中存在非法键，已跳过: %r", k)
-        return result
 
 
 # 调度器
@@ -219,15 +204,20 @@ def next_scheduled_time(minute: int = SCHEDULED_MINUTE) -> datetime:
 
 def wait_until(target: datetime) -> None:
     """阻塞等待到指定时刻（每分钟唤醒一次，便于响应 Ctrl-C）"""
+    # 只在首次打印等待信息
+    first_log = True
     while True:
         secs = (target - datetime.now(timezone.utc)).total_seconds()
         if secs <= 0:
             return
-        log.info(
-            "下次查询：%s UTC（%.0f 分钟后）",
-            target.strftime("%H:%M"),
-            secs / 60,
-        )
+        # 首次或剩余时间少于 5 分钟时打印日志
+        if first_log or secs < 300:
+            log.info(
+                "下次查询：%s UTC（%.0f 分钟后）",
+                target.strftime("%H:%M"),
+                secs / 60,
+            )
+            first_log = False
         time.sleep(min(secs, 60))
 
 
@@ -439,19 +429,24 @@ def filter_by_norad(records: list[dict], norad_ids: list[int]) -> dict[int, list
     返回每个卫星的所有记录（按 CREATION_DATE 排序）
     这样可以保留完整的历史更新记录，用于趋势分析
     """
+    # 将目标列表转为集合，提高查找效率
     target_set = set(norad_ids)
+    
+    # 按 NORAD ID 分组
     grouped: dict[int, list[dict]] = {}
     for rec in records:
         try:
             nid = int(rec.get("NORAD_CAT_ID") or 0)
         except (ValueError, TypeError):
-            continue
+            continue  # 跳过无效记录
         if nid in target_set:
+            # 添加到对应卫星的记录列表
             grouped.setdefault(nid, []).append(rec)
 
     # 对每个卫星的记录按时间排序（从旧到新）
     found: dict[int, list[dict]] = {}
     for nid, recs in grouped.items():
+        # 使用模块级排序函数 _record_sort_key
         found[nid] = sorted(recs, key=_record_sort_key)
     return found
 
@@ -619,47 +614,55 @@ def process_records(
     处理每个卫星的所有历史记录
     无论是否命中目标都更新缓存时间戳，防止速率保护卡死
     """
-    updated_orbits: dict[int, dict] = {}
-
+    # 遍历所有监控目标
     for norad_id in NORAD_IDS:
+        # 获取该卫星在本批次中的所有记录（已按时间排序）
         record_list = raw_records.get(norad_id)
         if not record_list:
+            # 本批次中没有该卫星的新 TLE
             msg = f"[{norad_id}] 本批次无数据（过去 1 小时内未发布新 TLE）"
             log.info(msg)
             write_log_message(msg)
             continue
 
-        # 处理该卫星的所有历史记录
-        prev = prev_data.get(norad_id)
+        # 获取上一次记录的轨道数据（用于计算变化量）
+        prev = prev_data.get(norad_id)  # 初始的上一条轨道数据
+        
+        # 处理该卫星的所有历史记录（同一小时内可能有多次更新）
         for record in record_list:
+            # 解析轨道参数并计算 Hash
             orbit = parse_orbit(record)
             cur_hash = orbit["tle_hash"]
 
-            # 检测 TLE 是否变化
+            # 检测 TLE 是否变化（与最新 Hash 比较）
             if cur_hash != last_hash.get(norad_id):
+                # Hash 不同，说明轨道数据有更新
                 msg = f"[{norad_id}] 检测到 TLE 变化！(hash: {last_hash.get(norad_id, '无')} → {cur_hash})"
                 log.info(msg)
                 write_log_message(msg)
+                
+                # 打印轨道信息（显示与上一次的差异）
                 print_orbit(orbit, prev)
+                
+                # 写入数据日志文件（保留所有历史版本）
                 log_record(orbit)
-                prev_data[norad_id] = orbit
-                last_hash[norad_id] = cur_hash
-                prev = orbit
+                
+                # 更新内存中的状态（供下次比较使用）
+                prev_data[norad_id] = orbit  # 更新最新轨道数据
+                last_hash[norad_id] = cur_hash  # 更新最新 Hash
+                prev = orbit  # 更新 prev，供下一条记录比较
             elif not ONLY_PRINT_ON_UPDATE:
-                print_orbit(orbit, None)
+                # Hash 相同，但配置为打印所有数据
+                print_orbit(orbit, None)  # TLE 未变化，不显示 delta
             else:
+                # Hash 相同，且配置为仅打印变化，只记录日志
                 msg = f"[{norad_id}] {orbit['name']}：TLE 未变化（hash {cur_hash}）"
                 log.info(msg)
                 write_log_message(msg)
 
-            # 更新为最新的轨道数据
-            updated_orbits[norad_id] = orbit
-
-    # 更新缓存（只保存每个卫星的最新状态）
-    if updated_orbits:
-        cache.update(updated_orbits)
-    else:
-        cache.mark_fetched()
+    # 更新缓存时间戳（全量数据已在 save_raw_records 中保存）
+    # 即使没有命中目标，也要更新时间戳，避免下次启动时重复请求
+    cache.mark_fetched()
 
 
 # 主程序
@@ -685,15 +688,11 @@ def main() -> None:
     write_log_message("程序启动")
     write_log_message(f"监控目标: {', '.join(str(i) for i in NORAD_IDS)}")
 
-    # 加载缓存或从日志恢复
+    # 加载缓存
     cache = LocalCache(CACHE_FILE)
-    cached_orbits = cache.all_cached_orbits()
 
-    if cached_orbits:
-        prev_data: dict[int, dict] = {k: v for k, v in cached_orbits.items() if k in NORAD_IDS}
-        log.info("已从缓存恢复 %d 个目标", len(prev_data))
-    else:
-        prev_data = restore_from_log(NORAD_IDS)
+    # 从数据日志恢复历史轨道状态
+    prev_data = restore_from_log(NORAD_IDS)
 
     # 初始化哈希字典，用于检测 TLE 变化
     last_hash: dict[int, str] = {
@@ -710,14 +709,17 @@ def main() -> None:
     with SpaceTrackSession() as st:
         first_run = True
         while True:
-            # 首次运行时：如果没有缓存记录，立即执行；否则检查速率限制
+            # === 确定是否需要等待 ===
             if first_run:
+                # 首次启动：检查距上次请求的时间
                 first_run = False  # 先置位，无论后续是否 continue 都不会重入
                 secs_since = cache.seconds_since_last_fetch()
                 if secs_since == float("inf"):
+                    # 从未请求过，立即执行首次查询
                     log.info("首次启动：无历史记录，将立即执行首次查询")
                     write_log_message("首次启动：无历史记录，立即执行首次查询")
                 elif secs_since < MIN_REQUEST_INTERVAL:
+                    # 距上次请求不足 1 小时，需要等待以满足速率限制
                     wait_seconds = MIN_REQUEST_INTERVAL - secs_since
                     log.warning(
                         "首次启动：距上次请求仅 %.0f 分钟，需等待 %.0f 分钟以满足速率限制",
@@ -725,36 +727,46 @@ def main() -> None:
                     )
                     write_log_message(f"首次启动速率保护：需等待 {wait_seconds/60:.0f} 分钟")
                     time.sleep(wait_seconds)
+                # 如果 secs_since >= MIN_REQUEST_INTERVAL，无需等待，直接执行
             else:
-                # 非首次运行，计算下次唤醒时间并等待
+                # 非首次运行：计算下次唤醒时间并等待
+                # 同时考虑调度时刻和速率限制，取较晚的时刻
                 wake_at = compute_next_wake(cache, SCHEDULED_MINUTE)
                 wait_until(wake_at)
 
+            # === 登录并拉取数据 ===
             now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
             msg = f"[{now_str}] 开始批量拉取..."
             log.info(msg)
             write_log_message(msg)
 
-            # 确保会话有效
+            # 确保会话有效（超过 90 分钟会自动重新登录）
             if not st.ensure_fresh_session():
                 msg = "登录失败，等待下一个调度周期"
                 log.error(msg)
                 write_log_message(msg)
                 continue
 
-            # 批量拉取 TLE 数据
+            # 批量拉取最近 1 小时内发布的所有 TLE
             all_records = fetch_bulk_with_relogin(st)
             if all_records is None:
+                # 拉取失败（网络错误、JSON 解析失败等）
                 msg = "本次拉取失败，等待下一个调度周期"
                 log.error(msg)
                 write_log_message(msg)
                 continue
 
-            # 筛选目标卫星
+            # === 保存全量数据到缓存 ===
+            # tle_cache.json 存储 Space-Track 返回的所有原始记录（覆盖旧数据）
+            cache.save_raw_records(all_records)
+
+            # === 筛选目标卫星 ===
+            # 从全量数据中筛选出 NORAD_IDS 中的卫星
             raw_records = filter_by_norad(all_records, NORAD_IDS)
             found_ids = list(raw_records.keys())
             missing_ids = [nid for nid in NORAD_IDS if nid not in raw_records]
 
+            # 记录筛选结果
             if found_ids:
                 msg = f"筛选命中：{', '.join(str(i) for i in found_ids)}"
                 log.info(msg)
@@ -764,7 +776,7 @@ def main() -> None:
                 log.info(msg)
                 write_log_message(msg)
 
-            # 处理记录
+            # === 处理记录，Hash 比对，写入日志 ===
             process_records(raw_records, prev_data, last_hash, cache)
 
 
