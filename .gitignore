@@ -1,2 +1,10 @@
 .env
 tle_log.jsonl
+/tle_cache.json
+/tle_data.jsonl
+/.idea/vcs.xml
+/.idea/.gitignore
+/.idea/misc.xml
+/.idea/modules.xml
+/.idea/inspectionProfiles/profiles_settings.xml
+/.idea/TEL-Tracking.iml
