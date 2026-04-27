@@ -43,14 +43,26 @@ pip install requests python-dotenv
 
 
 
-### 2️ 配置账号（推荐使用 `.env`）
+### 2️ 配置账号
 
-创建 `.env` 文件：
+**方式一：使用模板文件**
+
+```bash
+cp .env.example .env
+```
+
+将`.env.example`复制重命名为 `.env`，然后编辑 `.env` 文件，填入你的 Space-Track 账号密码：
 
 ```env
 SPACETRACK_USER=your_username
 SPACETRACK_PASS=your_password
 ```
+
+**方式二：手动创建**
+
+直接创建 `.env` 文件并填写上述内容。
+
+> **注意**：`.env` 文件包含敏感信息，不要提供给其他人
 
 
 
@@ -64,25 +76,43 @@ python spacetrack_monitor.py
 
 ## 配置说明
 
-顶部提供可调参数：
+### 业务配置（config.yaml）
 
-```python
-NORAD_IDS = [68765, 25544]    # 监控目标（NORAD 编号列表）
-SCHEDULED_MINUTE = 12         # 每小时请求的分钟数（建议 12 或 48）
-DATA_LOG_FILE = "tle_data.jsonl"  # 最终轨道数据文件
-CACHE_FILE = "tle_cache.json"     # 临时缓存文件
-LOG_FILE = "tle_log.jsonl"        # 运行日志文件
-REENTRY_WARNING_KM = 200      # 再入预警阈值（km）
-ONLY_PRINT_ON_UPDATE = True   # 仅在 TLE 变化时打印
+所有业务参数已移至 `config.yaml`，修改后重启脚本即可生效：
+
+```yaml
+targets:
+  norad_ids: [25544]          # 监控目标（NORAD 编号列表）
+
+schedule:
+  minute: 12                  # 每小时请求的分钟数（建议 12 或 48）
+
+files:
+  data_log: tle_data.jsonl    # 最终轨道数据文件
+  cache: tle_cache.json       # 临时缓存文件
+  run_log: tle_log.jsonl      # 运行日志文件
+  max_log_size_mb: 10         # 日志轮转阈值（MB）
+
+alerts:
+  reentry_warning_km: 200     # 再入预警阈值（km）
+  only_print_on_update: true  # 仅在 TLE 变化时打印
+
+retry:
+  login_max_failures: 5       # 登录最大失败次数
+  login_pause_seconds: 1800   # 登录失败后等待时间（秒）
+  request_max_retries: 3      # 请求最大重试次数
+  request_retry_base: 5       # 指数退避基数（秒）
 ```
 
-### 文件说明
+### 数据文件
+
+脚本运行后会自动生成以下文件：
 
 - **tle_data.jsonl**: 存储最终的轨道数据（每次 TLE 更新时记录），每条记录包含 `change_type` 字段（initial/correction/maneuver），便于后处理过滤真实机动事件，带轮转保护
 - **tle_cache.json**: 临时缓存，保存上次请求时间、全量原始数据和待处理标记，支持断点恢复，自动覆盖
 - **tle_log.jsonl**: 运行日志，记录程序运行状态，带轮转保护
 
-当文件大小超过 10MB 时，会自动轮转为 `.bak` 备份文件。
+> **日志轮转**：当文件大小超过配置的阈值（默认 10MB）时，会自动重命名为 `.bak` 备份文件。
 
 ---
 

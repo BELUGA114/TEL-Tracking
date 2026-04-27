@@ -1,4 +1,5 @@
 .env
+!.env.example
 tle_log.jsonl
 /tle_cache.json
 /tle_data.jsonl

@@ -26,46 +26,65 @@ from enum import Enum, auto
 from typing import Optional
 
 import requests
+import yaml
 
 load_dotenv()
 
-# 用户配置
-
+# 密钥（来自 .env）
 USERNAME = os.getenv("SPACETRACK_USER")
 PASSWORD = os.getenv("SPACETRACK_PASS")
 
-# 监控目标的 NORAD 编号列表，可填多个
-# 常用目标示例：25544 (ISS)
-NORAD_IDS: list[int] = [25544]
+# 业务配置（来自 config.yaml）
 
-# 每小时请求的分钟数（建议 12 或 48，避开整点/半点高峰）
-SCHEDULED_MINUTE = 12
+def _load_config(path: str = "config.yaml") -> dict:
+    """加载 YAML 配置文件,文件不存在时返回空 dict(全部使用默认值)"""
+    # 支持从任意目录运行脚本,自动定位到脚本所在目录的 config.yaml
+    if not os.path.isabs(path):
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        path = os.path.join(script_dir, path)
+    
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+        log.debug("已加载配置文件:%s", path)
+        return cfg
+    except FileNotFoundError:
+        # 配置文件不存在时全部使用默认值,方便快速测试
+        logging.getLogger(__name__).warning(
+            "未找到 %s,所有参数使用默认值", path
+        )
+        return {}
+    except (yaml.YAMLError, OSError) as e:
+        logging.getLogger(__name__).error("配置文件加载失败: %s", e)
+        raise SystemExit(1)
 
-# 文件路径配置
-DATA_LOG_FILE = "tle_data.jsonl"  # 最终轨道数据（带轮转保护）
-CACHE_FILE = "tle_cache.json"      # 临时缓存，自动覆盖
-LOG_FILE = "tle_log.jsonl"         # 运行日志（带轮转保护）
+_cfg = _load_config()
 
+# 用户可配置项（config.yaml 中可覆盖，括号内为默认值）
+# 目标
+NORAD_IDS: list[int] = _cfg.get("targets", {}).get("norad_ids", [25544])
+SCHEDULED_MINUTE: int = _cfg.get("schedule", {}).get("minute", 12)  # 每小时请求的分钟数（建议 12 或 48，避开整点/半点高峰）
+# 文件路径
+DATA_LOG_FILE: str = _cfg.get("files", {}).get("data_log", "tle_data.jsonl")    # 最终轨道数据（带轮转保护）
+CACHE_FILE: str = _cfg.get("files", {}).get("cache",    "tle_cache.json")   # 临时缓存，自动覆盖
+LOG_FILE: str = _cfg.get("files", {}).get("run_log",  "tle_log.jsonl")  # 运行日志（带轮转保护）
 # 预警阈值
-REENTRY_WARNING_KM = 200  # 近地点低于此值时发出再入预警
-ONLY_PRINT_ON_UPDATE = True  # 仅在 TLE 变化时打印输出
-
+REENTRY_WARNING_KM: int  = _cfg.get("alerts", {}).get("reentry_warning_km",   200)  # 近地点低于此值时发出再入预警
+ONLY_PRINT_ON_UPDATE: bool = _cfg.get("alerts", {}).get("only_print_on_update", True)  # 仅在 TLE 变化时打印输出
 # 重试和速率限制配置
-LOGIN_MAX_FAILURES = 5  # 登录最大失败次数
-LOGIN_PAUSE_SECONDS = 1800  # 登录失败后等待时间（秒）
+LOGIN_MAX_FAILURES: int = _cfg.get("retry", {}).get("login_max_failures",  5)  # 登录最大失败次数
+LOGIN_PAUSE_SECONDS: int = _cfg.get("retry", {}).get("login_pause_seconds", 1800)  # 登录失败后等待时间（秒）
+REQUEST_MAX_RETRIES: int = _cfg.get("retry", {}).get("request_max_retries", 3)  # 请求最大重试次数
+REQUEST_RETRY_BASE: int = _cfg.get("retry", {}).get("request_retry_base",  5)  # 指数退避基数（秒）：5, 10, 20 ...
 
-REQUEST_MAX_RETRIES = 3  # 请求最大重试次数
-REQUEST_RETRY_BASE = 5  # 指数退避基数（秒）：5, 10, 20 ...
-
-# Space-Track API 速率限制：每小时最多 1 次 gp 类请求
-# 违反此限制会导致账号被警告或封禁
-MIN_REQUEST_INTERVAL = 3600  # 两次请求最小间隔（秒）
-
-# Space-Track 会话最长有效期（秒），保守取 90 分钟
-SESSION_MAX_AGE = 5400
+# 以下参数涉及 API 合规，不暴露在 config.yaml 中，避免用户误改导致封号
+MIN_REQUEST_INTERVAL: int = 3600   # 两次请求最小间隔（秒），勿修改
+SESSION_MAX_AGE: int = 5400   # 会话最长有效期（秒），勿修改
 
 # 日志文件最大大小（字节），超过后自动轮转（10 MB）
-MAX_LOG_SIZE = 10 * 1024 * 1024
+MAX_LOG_SIZE: int = _cfg.get("files", {}).get(
+    "max_log_size_mb", 10
+) * 1024 * 1024
 
 # 安全的回退时间值（用于排序）
 _EPOCH_MIN = datetime(2000, 1, 1, tzinfo=timezone.utc)
@@ -734,14 +753,18 @@ def process_records(
 # 主程序
 
 def main() -> None:
-    """主函数：启动 TLE 监控循环"""
-    # 检查凭据
+    """主函数:启动 TLE 监控循环"""
+    # 检查凭据（优先检查,避免后续运行时才发现缺失）
     if not USERNAME or not PASSWORD:
-        log.error("缺少 Space-Track 凭据！")
-        log.error("请在 .env 文件中设置 SPACETRACK_USER 和 SPACETRACK_PASS")
+        log.error("缺少 Space-Track 凭据!")
+        log.error("请在项目根目录创建 .env 文件并设置:")
+        log.error("  SPACETRACK_USER=your_email@example.com")
+        log.error("  SPACETRACK_PASS=your_password")
+        log.error("可参考 .env.example 模板文件")
         raise SystemExit(1)
 
     log.info("Space-Track 轨道监控")
+    log.info("配置文件: config.yaml | 密钥: .env")
     log.info("目标: %s", ", ".join(str(i) for i in NORAD_IDS))
     log.info(
         "调度: 每小时第 %02d 分 | 再入预警: <%d km | 数据日志: %s | 运行日志: %s | 缓存: %s",
