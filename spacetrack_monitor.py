@@ -18,6 +18,7 @@ import hashlib
 import json
 import logging
 import math
+import sys
 import time
 import os
 from dotenv import load_dotenv
@@ -816,6 +817,12 @@ def main() -> None:
         orbit = prev_data.get(norad_id)
         if orbit:
             print_orbit(orbit, None)
+    
+    # 强制刷新所有输出缓冲区，确保顺序正确
+    for handler in logging.root.handlers[:]:
+        handler.flush()
+    sys.stdout.flush()
+
 
     # 主循环
     with SpaceTrackSession() as st:
