@@ -655,32 +655,68 @@ def write_log_message(message: str) -> None:
 
 # 状态恢复
 
+def _iter_jsonl_reversed(path: str, chunk: int = 65536):
+    """
+    从文件末尾逐块反向读取 JSONL
+    """
+    with open(path, "rb") as f:
+        f.seek(0, 2)
+        remaining = f.tell()
+        
+        if remaining == 0:
+            return
+        
+        buf = b""
+        while remaining > 0:
+            read_size = min(chunk, remaining)
+            remaining -= read_size
+            f.seek(remaining)
+            buf = f.read(read_size) + buf
+            lines = buf.split(b"\n")
+            # 最左边的块可能是不完整行，留到下次拼接
+            buf = lines[0]
+            for line in reversed(lines[1:]):
+                line = line.strip()
+                if line:
+                    yield line.decode("utf-8", errors="replace")
+        # 处理文件开头剩余内容
+        if buf.strip():
+            yield buf.strip().decode("utf-8", errors="replace")
+
+
 def restore_from_log(norad_ids: list[int]) -> dict[int, dict]:
-    """从 DATA_FILE 恢复历史轨道状态"""
+    """从 DATA_FILE 末尾反向扫描，恢复每个目标的最新轨道状态。"""
     prev_data: dict[int, dict] = {}
     if not DATA_FILE:
         return prev_data
-    try:
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-    except OSError:
-        return prev_data
+    
+    target_set = set(norad_ids)
     seen: set[int] = set()
-    # 从后往前读取，获取每个卫星的最新记录
-    for line in reversed(lines):
-        try:
-            entry = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        norad = entry.get("norad")
-        if norad not in norad_ids or norad in seen:
-            continue
-        prev_data[norad] = entry
-        seen.add(norad)
-        if len(seen) == len(norad_ids):
-            break
-    if prev_data:
-        log.info("已从轨道数据文件恢复 %d 个目标的历史状态", len(prev_data))
+    
+    try:
+        for line in _iter_jsonl_reversed(DATA_FILE):
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            
+            norad = entry.get("norad")
+            if norad not in target_set or norad in seen:
+                continue
+            
+            prev_data[norad] = entry
+            seen.add(norad)
+            
+            # 找到所有目标，立即退出
+            if len(seen) == len(target_set):
+                break
+        
+        if prev_data:
+            log.info("已从轨道数据文件恢复 %d 个目标的历史状态", len(prev_data))
+    
+    except OSError as e:
+        log.warning("轨道数据文件读取失败: %s", e)
+    
     return prev_data
 
 
