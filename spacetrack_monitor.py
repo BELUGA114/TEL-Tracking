@@ -46,7 +46,7 @@ def _load_config(path: str = "config.yaml") -> dict:
     try:
         with open(path, "r", encoding="utf-8") as f:
             cfg = yaml.safe_load(f) or {}
-        log.debug("已加载配置文件:%s", path)
+        logging.getLogger(__name__).debug("已加载配置文件:%s", path)
         return cfg
     except FileNotFoundError:
         # 配置文件不存在时全部使用默认值,方便快速测试
@@ -65,7 +65,7 @@ _cfg = _load_config()
 NORAD_IDS: list[int] = _cfg.get("targets", {}).get("norad_ids", [25544])
 SCHEDULED_MINUTE: int = _cfg.get("schedule", {}).get("minute", 12)  # 每小时请求的分钟数（建议 12 或 48，避开整点/半点高峰）
 # 文件路径
-DATA_LOG_FILE: str = _cfg.get("files", {}).get("data_log", "tle_data.jsonl")    # 最终轨道数据（带轮转保护）
+DATA_FILE: str = _cfg.get("files", {}).get("data_file", "tle_data.jsonl")    # 轨道数据文件（带轮转保护）
 CACHE_FILE: str = _cfg.get("files", {}).get("cache",    "tle_cache.json")   # 临时缓存，自动覆盖
 LOG_FILE: str = _cfg.get("files", {}).get("run_log",  "tle_log.jsonl")  # 运行日志（带轮转保护）
 # 预警阈值
@@ -197,7 +197,8 @@ class LocalCache:
         ts = self.last_fetch_ts
         if ts is None:
             return float("inf")  # 从未请求过，返回无穷大
-        return (datetime.now(timezone.utc) - ts).total_seconds()
+        now = datetime.now(timezone.utc)
+        return (now - ts).total_seconds()
 
     def mark_fetched(self) -> None:
         """更新请求时间戳（请求成功时使用）"""
@@ -274,10 +275,11 @@ def compute_next_wake(cache: LocalCache, minute: int = SCHEDULED_MINUTE) -> date
         )
         # 如果速率限制时刻晚于调度时刻，需要推迟到下一个小时
         if rate_ok_at > sched:
+            mins_since = secs_since / 60
             log.info(
-                "速率保护：需等至 %s UTC（距上次请求仅 %.0f 分钟）",
+                "速率保护：需等至 %s UTC（距上次请求 %.0f 分钟）",
                 rate_ok_at.strftime("%H:%M"),
-                secs_since / 60,
+                mins_since,
             )
             while sched <= rate_ok_at:
                 sched += timedelta(hours=1)
@@ -621,20 +623,20 @@ def print_orbit(orbit: dict, prev: Optional[dict]) -> None:
 
 
 def log_record(orbit: dict, change_type: str = "unknown") -> None:
-    """将轨道数据写入 DATA_LOG_FILE（最终数据文件）"""
-    if not DATA_LOG_FILE:
+    """将轨道数据写入 DATA_FILE（核心业务数据）"""
+    if not DATA_FILE:
         return
-    rotate_file_if_needed(DATA_LOG_FILE)
+    rotate_file_if_needed(DATA_FILE)
     entry = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "change_type": change_type,  # 变化类型：initial/correction/maneuver
         **orbit
     }
     try:
-        with open(DATA_LOG_FILE, "a", encoding="utf-8") as f:
+        with open(DATA_FILE, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
     except OSError as e:
-        log.error("数据日志写入失败: %s", e)
+        log.error("轨道数据写入失败: %s", e)
 
 
 def write_log_message(message: str) -> None:
@@ -653,12 +655,12 @@ def write_log_message(message: str) -> None:
 # 状态恢复
 
 def restore_from_log(norad_ids: list[int]) -> dict[int, dict]:
-    """从 DATA_LOG_FILE 恢复历史轨道状态"""
+    """从 DATA_FILE 恢复历史轨道状态"""
     prev_data: dict[int, dict] = {}
-    if not DATA_LOG_FILE:
+    if not DATA_FILE:
         return prev_data
     try:
-        with open(DATA_LOG_FILE, "r", encoding="utf-8") as f:
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
             lines = f.readlines()
     except OSError:
         return prev_data
@@ -677,7 +679,7 @@ def restore_from_log(norad_ids: list[int]) -> dict[int, dict]:
         if len(seen) == len(norad_ids):
             break
     if prev_data:
-        log.info("已从数据日志恢复 %d 个目标的历史状态", len(prev_data))
+        log.info("已从轨道数据文件恢复 %d 个目标的历史状态", len(prev_data))
     return prev_data
 
 
@@ -700,9 +702,7 @@ def process_records(
         record = raw_records.get(norad_id)
         if not record:
             # 本批次中没有该卫星的新 TLE
-            msg = f"[{norad_id}] 本批次无数据（过去 1 小时内未发布新 TLE）"
-            log.info(msg)
-            write_log_message(msg)
+            log.info("[%d] 本批次无数据（过去 1 小时内未发布新 TLE）", norad_id)
             continue
 
         # 提取批次记录数（元数据，不进入 orbit）
@@ -730,7 +730,7 @@ def process_records(
             # 打印轨道信息（显示与上一次的差异）
             print_orbit(orbit, prev)
             
-            # 写入数据日志文件（附带变化类型）
+            # 写入轨道数据文件（附带变化类型）
             log_record(orbit, change_type)
             
             # 更新内存中的状态（供下次比较使用）
@@ -741,9 +741,7 @@ def process_records(
             print_orbit(orbit, None)  # TLE 未变化，不显示 delta
         else:
             # Hash 相同，且配置为仅打印变化，只记录日志
-            msg = f"[{norad_id}] {orbit['name']}：TLE 未变化（hash {cur_hash}）"
-            log.info(msg)
-            write_log_message(msg)
+            log.info("[%d] %s：TLE 未变化（hash %s）", norad_id, orbit['name'], cur_hash)
 
     # 更新缓存时间戳（全量数据已在 save_raw_records 中保存）
     # 即使没有命中目标，也要更新时间戳，避免下次启动时重复请求
@@ -767,20 +765,19 @@ def main() -> None:
     log.info("配置文件: config.yaml | 密钥: .env")
     log.info("目标: %s", ", ".join(str(i) for i in NORAD_IDS))
     log.info(
-        "调度: 每小时第 %02d 分 | 再入预警: <%d km | 数据日志: %s | 运行日志: %s | 缓存: %s",
+        "调度: 每小时第 %02d 分 | 再入预警: <%d km | 轨道数据: %s | 运行日志: %s | 缓存: %s",
         SCHEDULED_MINUTE, REENTRY_WARNING_KM,
-        DATA_LOG_FILE or "关闭", LOG_FILE or "关闭", CACHE_FILE or "关闭",
+        DATA_FILE or "关闭", LOG_FILE or "关闭", CACHE_FILE or "关闭",
     )
     print()
 
     # 写入启动日志（确保日志文件被创建）
     write_log_message("程序启动")
-    write_log_message(f"监控目标: {', '.join(str(i) for i in NORAD_IDS)}")
 
     # 加载缓存
     cache = LocalCache(CACHE_FILE)
 
-    # 从数据日志恢复历史轨道状态（必须在断点恢夏之前）
+    # 从轨道数据文件恢复历史轨道状态（必须在断点恢复之前）
     prev_data = restore_from_log(NORAD_IDS)
 
     # 初始化哈希字典，用于检测 TLE 变化
@@ -791,7 +788,6 @@ def main() -> None:
     # 检查是否有待处理的数据（断点恢复）
     if cache.has_pending_data:
         log.info("检测到未处理的全量数据，尝试断点恢复...")
-        write_log_message("检测到未处理数据，进行断点恢复")
         
         # 从缓存中获取全量原始数据
         all_records = cache.get_raw_records()
@@ -812,7 +808,6 @@ def main() -> None:
             # 清除待处理标记
             cache.clear_pending()
             log.info("断点恢复完成")
-            write_log_message("断点恢复完成")
         else:
             log.warning("缓存中有待处理标记，但无实际数据")
 
@@ -834,15 +829,13 @@ def main() -> None:
                 if secs_since == float("inf"):
                     # 从未请求过，立即执行首次查询
                     log.info("无历史记录，将立即执行首次查询")
-                    write_log_message("无历史记录，立即执行首次查询")
                 elif secs_since < MIN_REQUEST_INTERVAL:
                     # 距上次请求不足 1 小时，需要等待以满足速率限制
                     wait_seconds = MIN_REQUEST_INTERVAL - secs_since
                     log.warning(
-                        "距上次请求仅 %.0f 分钟，需等待 %.0f 分钟以满足速率限制",
+                        "距上次请求 %.0f 分钟，需等待 %.0f 分钟以满足速率限制",
                         secs_since / 60, wait_seconds / 60
                     )
-                    write_log_message(f"速率保护：需等待 {wait_seconds/60:.0f} 分钟")
                     time.sleep(wait_seconds)
                 # 如果 secs_since >= MIN_REQUEST_INTERVAL，无需等待，直接执行
             else:
@@ -852,25 +845,17 @@ def main() -> None:
                 wait_until(wake_at)
 
             # === 登录并拉取数据 ===
-            now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-            msg = f"[{now_str}] 开始批量拉取..."
-            log.info(msg)
-            write_log_message(msg)
+            log.info("[%s] 开始批量拉取...", datetime.now(timezone.utc).strftime("%H:%M:%S"))
 
             # 确保会话有效（超过 90 分钟会自动重新登录）
             if not st.ensure_fresh_session():
-                msg = "登录失败，等待下一个调度周期"
-                log.error(msg)
-                write_log_message(msg)
+                log.error("登录失败，等待下一个调度周期")
                 continue
 
             # 批量拉取最近 1 小时内发布的所有 TLE
             all_records = fetch_bulk_with_relogin(st)
             if all_records is None:
-                # 拉取失败（网络错误、JSON 解析失败等）
-                msg = "本次拉取失败，等待下一个调度周期"
-                log.error(msg)
-                write_log_message(msg)
+                log.error("本次拉取失败，等待下一个调度周期")
                 continue
 
             # === 保存全量数据到缓存 ===
@@ -885,13 +870,9 @@ def main() -> None:
 
             # 记录筛选结果
             if found_ids:
-                msg = f"筛选命中：{', '.join(str(i) for i in found_ids)}"
-                log.info(msg)
-                write_log_message(msg)
+                log.info("筛选命中：%s", ', '.join(str(i) for i in found_ids))
             if missing_ids:
-                msg = f"本批次未包含（过去 1 小时内无新 TLE）：{', '.join(str(i) for i in missing_ids)}"
-                log.info(msg)
-                write_log_message(msg)
+                log.info("本批次未包含（过去 1 小时内无新 TLE）：%s", ', '.join(str(i) for i in missing_ids))
 
             # === 处理记录，Hash 比对，写入日志 ===
             process_records(raw_records, prev_data, last_hash, cache)

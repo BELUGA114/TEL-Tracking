@@ -7,11 +7,11 @@ targets:
 
 schedule:
   # 每小时请求的分钟数，比如 12 或 48（避开整点/半点高峰）
-  # 修改为其他值可能增加账号违规风险
-  minute: 12
+  # 修改为整点/半点可能增加账号违规风险
+  minute: 17
 
 files:
-  data_log: tle_data.jsonl   # 轨道数据日志（带轮转保护）
+  data_file: tle_data.jsonl    # 轨道数据文件（带轮转保护）
   cache: tle_cache.json      # 运行缓存，自动覆盖
   run_log: tle_log.jsonl     # 运行日志（带轮转保护）
   max_log_size_mb: 10        # 日志轮转阈值（MB）

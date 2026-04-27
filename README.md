@@ -27,15 +27,15 @@
 * **批量拉取 + 本地筛选**：避开整点/半点高峰期，节省带宽，符合官方推荐
 * **TLE 变化智能分类**：自动区分解算修正（Correction）与真实机动（Maneuver）
 * **断点恢复机制**：程序崩溃后自动从缓存恢复未处理数据，避免数据丢失
-* **双日志系统**：轨道数据日志（带 `change_type` 标记）+ 运行日志（JSONL，带轮转保护）
-* **重启自动恢复状态**：从历史数据恢复上次轨道状态，避免误判"首次变化"
+* **双日志系统**：轨道数据文件（带 `change_type` 标记）+ 运行日志（JSONL，带轮转保护）
+* **重启自动恢复状态**：从历史数据恢复上次轨道状态，避免误判“首次变化”
 
 
 ---
 
 ## 快速开始
 
-### 1️ 安装依赖
+### 1. 安装依赖
 
 ```bash
 pip install requests python-dotenv
@@ -43,7 +43,7 @@ pip install requests python-dotenv
 
 
 
-### 2️ 配置账号
+### 2. 配置账号
 
 **方式一：使用模板文件**
 
@@ -66,7 +66,7 @@ SPACETRACK_PASS=your_password
 
 
 
-### 3️ 运行脚本
+### 3. 运行脚本
 
 ```bash
 python spacetrack_monitor.py
@@ -88,7 +88,7 @@ schedule:
   minute: 12                  # 每小时请求的分钟数（建议 12 或 48）
 
 files:
-  data_log: tle_data.jsonl    # 最终轨道数据文件
+  data_file: tle_data.jsonl   # 轨道数据文件
   cache: tle_cache.json       # 临时缓存文件
   run_log: tle_log.jsonl      # 运行日志文件
   max_log_size_mb: 10         # 日志轮转阈值（MB）
@@ -108,7 +108,7 @@ retry:
 
 脚本运行后会自动生成以下文件：
 
-- **tle_data.jsonl**: 存储最终的轨道数据（每次 TLE 更新时记录），每条记录包含 `change_type` 字段（initial/correction/maneuver），便于后处理过滤真实机动事件，带轮转保护
+- **tle_data.jsonl**: 核心轨道数据（每次 TLE 更新时记录），每条记录包含 `change_type` 字段（initial/correction/maneuver），便于后处理过滤真实机动事件，带轮转保护
 - **tle_cache.json**: 临时缓存，保存上次请求时间、全量原始数据和待处理标记，支持断点恢复，自动覆盖
 - **tle_log.jsonl**: 运行日志，记录程序运行状态，带轮转保护
 
@@ -193,9 +193,9 @@ retry:
 
 ---
 
-## 日志格式（JSONL）
+## 数据格式（JSONL）
 
-### 轨道数据日志（tle_data.jsonl）
+### 轨道数据文件（tle_data.jsonl）
 
 每次 TLE 更新会记录完整轨道参数和变化类型：
 
