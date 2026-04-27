@@ -275,13 +275,14 @@ def compute_next_wake(cache: LocalCache, minute: int = SCHEDULED_MINUTE) -> date
             seconds=MIN_REQUEST_INTERVAL - secs_since
         )
         # 如果速率限制时刻晚于调度时刻，需要推迟到下一个小时
+        # 异常重启时的速率保护没有问题，但是以下log可能会误导人，所以取消
         if rate_ok_at > sched:
-            mins_since = secs_since / 60
-            log.info(
-                "速率保护：需等至 %s UTC（距上次请求 %.0f 分钟）",
-                rate_ok_at.strftime("%H:%M"),
-                mins_since,
-            )
+            # mins_since = secs_since / 60
+            # log.info(
+            #     "速率保护：需等至 %s UTC（距上次请求 %.0f 分钟）",
+            #     rate_ok_at.strftime("%H:%M"),
+            #     mins_since,
+            # )
             while sched <= rate_ok_at:
                 sched += timedelta(hours=1)
 
