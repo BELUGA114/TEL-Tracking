@@ -597,7 +597,7 @@ def print_orbit(orbit: dict, prev: Optional[dict]) -> None:
     delta = ""
     if prev:
         delta = f"  （近地点 {peri - prev['periapsis']:+.1f} km，远地点 {apo - prev['apoapsis']:+.1f} km）"
-    print(f"""
+    log.info(f"""
   ===============================================
     {orbit['name']:<20} NORAD {orbit['norad']}
     国际编号: {orbit['intl_id']}
@@ -613,15 +613,15 @@ def print_orbit(orbit: dict, prev: Optional[dict]) -> None:
     if REENTRY_WARNING_KM > 0 and peri < REENTRY_WARNING_KM:
         days = estimate_reentry_days(orbit)
         if days is not None:
-            print(f"   再入高风险：近地点 {peri:.1f} km，预计 {format_reentry_estimate(days)}，实际误差可达数倍")
+            log.info(f"   再入高风险：近地点 {peri:.1f} km，预计 {format_reentry_estimate(days)}，实际误差可达数倍")
         else:
-            print(f"   再入高风险：近地点 {peri:.1f} km")
+            log.info(f"   再入高风险：近地点 {peri:.1f} km")
             if orbit["bstar"] <= 0:
-                print("     BSTAR=0，寿命无法估算（可能为初始定轨解，阻力项尚未计算）")
+                log.info("     BSTAR=0，寿命无法估算（可能为初始定轨解，阻力项尚未计算）")
             else:
-                print("     近地点 > 400 km 或周期无效，不满足估算条件")
+                log.info("     近地点 > 400 km 或周期无效，不满足估算条件")
     elif peri < 300:
-        print(f"     注意：近地点 {peri:.1f} km，大气阻力明显，轨道将持续衰减")
+        log.info(f"     注意：近地点 {peri:.1f} km，大气阻力明显，轨道将持续衰减")
 
 
 def log_record(orbit: dict, change_type: str = "unknown") -> None:
@@ -854,12 +854,6 @@ def main() -> None:
         orbit = prev_data.get(norad_id)
         if orbit:
             print_orbit(orbit, None)
-    
-    # 强制刷新所有输出缓冲区，确保顺序正确
-    for handler in logging.root.handlers[:]:
-        handler.flush()
-    sys.stdout.flush()
-
 
     # 主循环
     with SpaceTrackSession() as st:
