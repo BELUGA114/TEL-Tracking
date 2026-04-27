@@ -25,7 +25,7 @@
 * **严格遵循 Space-Track API 速率限制**（每小时 1 次 gp 查询）
 * **智能调度系统**：同时考虑调度时刻和速率限制，确保永远合规
 * **批量拉取 + 本地筛选**：避开整点/半点高峰期，节省带宽，符合官方推荐
-* **TLE 变化智能分类**：自动区分解算修正（Correction）与真实机动（Maneuver）
+* **TLE 变化分类**：自动区分解算修正（Correction）与真实机动（Maneuver）
 * **断点恢复机制**：程序崩溃后自动从缓存恢复未处理数据，避免数据丢失
 * **双日志系统**：轨道数据文件（带 `change_type` 标记）+ 运行日志（JSONL，带轮转保护）
 * **重启自动恢复状态**：从历史数据恢复上次轨道状态，避免误判“首次变化”
@@ -35,41 +35,91 @@
 
 ## 快速开始
 
-### 1. 安装依赖
+### 1. 安装 Python 依赖
+
+确保你已经安装了 Python，然后在项目目录下运行：
 
 ```bash
 pip install requests python-dotenv
 ```
 
+---
 
+### 2. 配置 Space-Track 账号
 
-### 2. 配置账号
+**步骤 1：复制模板文件**
 
-**方式一：使用模板文件**
+将 `.env.example` 复制一份并重命名为 `.env`：
 
 ```bash
 cp .env.example .env
 ```
 
-将`.env.example`复制重命名为 `.env`，然后编辑 `.env` 文件，填入你的 Space-Track 账号密码：
+**步骤 2：填写账号密码**
+
+用文本编辑器打开 `.env` 文件，填入你的 Space-Track 账号和密码：
 
 ```env
-SPACETRACK_USER=your_username
+SPACETRACK_USER=your_email@example.com
 SPACETRACK_PASS=your_password
 ```
 
-**方式二：手动创建**
 
-直接创建 `.env` 文件并填写上述内容。
+> - `.env` 文件包含你的账号密码，不要分享给他人
+> - 如果没有 Space-Track 账号，需要先去 [space-track.org](https://www.space-track.org) 注册
 
-> **注意**：`.env` 文件包含敏感信息，不要提供给其他人
+---
 
+### 3. 配置监控目标
 
+如果你想修改监控的卫星或调整其他参数，可以编辑 `config.yaml` 文件
 
-### 3. 运行脚本
+**最简单的用法**：如果你只想监控 ISS，可以直接使用默认配置，无需修改
+
+**自定义配置示例**：
+
+```yaml
+targets:
+  norad_ids: [25544, 48273]  # 监控多个卫星，用逗号分隔
+
+schedule:
+  minute: 17  # 每小时第 17 分钟请求数据（避开整点/半点高峰）
+
+alerts:
+  reentry_warning_km: 200     # 近地点低于 200km 时发出预警
+  only_print_on_update: true  # 只在 TLE 变化时打印，避免刷屏
+```
+
+**常用配置说明**：
+- `norad_ids`: 要监控的卫星编号列表，可以在 [space-track.org](https://www.space-track.org) 查询
+- `minute`: 每小时请求数据的分钟数，建议设置为 12、17、42、48 等，避开 0 和 30
+- `only_print_on_update`: 设为 `true` 可以减少控制台输出，只在有更新时才显示
+
+> **提示**：修改 `config.yaml` 后需要重启脚本才能生效
+
+---
+
+### 4. 运行脚本
+
+在项目目录下运行：
 
 ```bash
 python spacetrack_monitor.py
+```
+
+首次运行时，脚本会：
+1. 加载你的账号配置
+2. 登录 Space-Track
+3. 立即执行第一次数据拉取
+4. 之后每小时自动检查一次
+
+看到类似以下输出表示运行成功：
+
+```
+2026-04-27 21:31:54 Space-Track 轨道监控
+2026-04-27 21:31:54 配置文件: config.yaml | 密钥: .env
+2026-04-27 21:31:54 目标: 25544
+2026-04-27 21:31:54 调度: 每小时第 17 分 | 再入预警: <200 km
 ```
 
 ---
@@ -78,7 +128,7 @@ python spacetrack_monitor.py
 
 ### 业务配置（config.yaml）
 
-所有业务参数已移至 `config.yaml`，修改后重启脚本即可生效：
+参数位于 `config.yaml`，修改后重启脚本即可生效：
 
 ```yaml
 targets:
