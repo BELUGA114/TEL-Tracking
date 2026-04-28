@@ -29,6 +29,15 @@ from typing import Optional
 import requests
 import yaml
 
+# xpropagator 客户端（插件式，找不到模块时自动禁用）
+try:
+    from xpropagator_client import classify_change_xprop, is_service_alive
+    _XPROP_MODULE_OK = True
+except ImportError:
+    _XPROP_MODULE_OK = False
+    classify_change_xprop = None   # type: ignore 忽略
+    is_service_alive       = None  # type: ignore 忽略
+
 load_dotenv()
 
 # 密钥（来自 .env）
@@ -77,6 +86,15 @@ LOGIN_MAX_FAILURES: int = _cfg.get("retry", {}).get("login_max_failures",  5)  #
 LOGIN_PAUSE_SECONDS: int = _cfg.get("retry", {}).get("login_pause_seconds", 1800)  # 登录失败后等待时间（秒）
 REQUEST_MAX_RETRIES: int = _cfg.get("retry", {}).get("request_max_retries", 3)  # 请求最大重试次数
 REQUEST_RETRY_BASE: int = _cfg.get("retry", {}).get("request_retry_base",  5)  # 指数退避基数（秒）：5, 10, 20 ...
+# xpropagator 残差分析配置
+_xprop_cfg = _cfg.get("xpropagator", {})
+XPROP_ENABLED: bool = _xprop_cfg.get("enabled", True)
+XPROP_HOST: str = _xprop_cfg.get("host", "localhost")
+XPROP_PORT: int = _xprop_cfg.get("port", 50051)
+XPROP_MANEUVER_THRESHOLD_KM: float = _xprop_cfg.get("maneuver_threshold_km", 5.0)
+
+# 实际是否可用 = 配置开启 + 模块导入成功
+XPROP_ACTIVE: bool = XPROP_ENABLED and _XPROP_MODULE_OK
 
 # 以下参数涉及 API 合规，不暴露在 config.yaml 中，避免用户误改导致封号
 MIN_REQUEST_INTERVAL: int = 3600   # 两次请求最小间隔（秒），勿修改
@@ -502,29 +520,40 @@ def filter_by_norad(records: list[dict], norad_ids: list[int]) -> dict[int, dict
 
 
 # 轨道数据处理
-
 def classify_change(orbit: dict, prev: Optional[dict]) -> str:
     """
-    粗略判断 TLE 变化是解算修正还是真实机动
-    判据：近地点/远地点变化幅度
-    - 解算误差通常在 2 km 以内
-    - 真实机动通常 > 5 km
+    判断 TLE 变化是真实机动还是解算修正。
+    优先策略（当 xpropagator 已启用且在线）：
+      残差分析，将旧 TLE 传播到新历元，对比 ECI 位置差
+      Δr ≥ XPROP_MANEUVER_THRESHOLD_KM km → maneuver
+      Δr <  XPROP_MANEUVER_THRESHOLD_KM km → correction
+
+      降级策略（xpropagator 不可用时）：
+      近地点/远地点变化 > 5 km → maneuver，否则 → correction
     """
     if prev is None:
-        return "initial"  # 首次记录
-    
+        return "initial"
+
+    # 高精度路径：xpropagator 残差分析
+    if XPROP_ACTIVE:
+        result = classify_change_xprop(orbit, prev,
+            maneuver_threshold_km=XPROP_MANEUVER_THRESHOLD_KM,
+            host=XPROP_HOST, port=XPROP_PORT,)
+        if result is not None:
+            return result
+        # RPC 调用失败（服务暂时不可用），降级处理
+        log.debug("[%d] xpropagator 本次调用失败，降级到简单阈值", orbit["norad"])
+
+    # 降级路径：简单近地点/远地点阈值（原逻辑）
     delta_peri = abs(orbit["periapsis"] - prev["periapsis"])
     delta_apo = abs(orbit["apoapsis"] - prev["apoapsis"])
-    
-    # 如果近地点或远地点变化超过 5 km，判定为疑似机动
     if delta_peri > 5.0 or delta_apo > 5.0:
-        return "maneuver"  # 疑似真实机动
-    
-    return "correction"  # 疑似解算修正
+        return "maneuver"
+    return "correction"
 
 
 def format_change_type(change_type: str) -> str:
-    """将变化类型转换为中英文对照格式"""
+    # 将变化类型转换为中英文对照格式
     type_map = {
         "initial": "首次记录 (Initial)",
         "correction": "解算修正 (Correction)",
@@ -534,7 +563,7 @@ def format_change_type(change_type: str) -> str:
 
 
 def parse_orbit(record: dict) -> dict:
-    """从 Space-Track 记录中提取轨道参数并计算哈希值"""
+    # 从提取轨道参数并计算哈希值
     name = (record.get("OBJECT_NAME") or "").strip()
     tle1 = str(record.get("TLE_LINE1") or "")
     tle2 = str(record.get("TLE_LINE2") or "")
@@ -802,6 +831,21 @@ def main() -> None:
     log.info("Space-Track 轨道监控")
     log.info("配置文件: config.yaml | 密钥: .env")
     log.info("目标: %s", ", ".join(str(i) for i in NORAD_IDS))
+
+    if XPROP_ACTIVE:
+        # 探活并打印版本信息
+        alive = is_service_alive(XPROP_HOST, XPROP_PORT)
+        if not alive:
+            log.warning(
+                "xpropagator 配置已启用但服务未响应（%s:%d），将自动降级到简单 5km 规则",
+                XPROP_HOST, XPROP_PORT,
+            )
+    else:
+        if XPROP_ENABLED and not _XPROP_MODULE_OK:
+            log.warning("xpropagator 已在 config.yaml 中启用，但 xpropagator_client.py 或 gRPC 存根未找到")
+        elif not XPROP_ENABLED:
+            log.info("xpropagator 残差分析已禁用（config.yaml xpropagator.enabled=false），使用简单阈值")
+
     log.info(
         "调度: 每小时第 %02d 分 | 再入预警: <%d km | 轨道数据: %s | 运行日志: %s | 缓存: %s",
         SCHEDULED_MINUTE, REENTRY_WARNING_KM,
