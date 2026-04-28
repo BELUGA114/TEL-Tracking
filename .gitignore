@@ -1,11 +1,37 @@
+# 环境变量和密钥
 .env
 !.env.example
+
+# Python 字节码缓存
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 项目数据文件（运行时生成）
 tle_log.jsonl
-/tle_cache.json
-/tle_data.jsonl
-/.idea/vcs.xml
-/.idea/.gitignore
-/.idea/misc.xml
-/.idea/modules.xml
-/.idea/inspectionProfiles/profiles_settings.xml
-/.idea/TEL-Tracking.iml
+tle_log.jsonl.bak
+tle_cache.json
+tle_data.jsonl
+tle_data.jsonl.bak
+
+# IDE 配置
+/.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# 操作系统文件
+.DS_Store
+Thumbs.db
+
+# 临时文件和备份
+*.tmp
+*.bak
+*.log
+
+# 虚拟环境
+venv/
+env/
+.venv/

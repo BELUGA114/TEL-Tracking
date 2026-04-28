@@ -19,9 +19,16 @@ files:
 alerts:
   reentry_warning_km: 200    # 近地点低于此值时发出再入预警
   only_print_on_update: true # true=仅在 TLE 变化时打印，false=每次都打印
+  fallback_maneuver_threshold_km: 5.0  # 降级策略阈值（km），xpropagator 不可用时使用
 
 retry:
   login_max_failures: 5      # 登录连续失败上限
   login_pause_seconds: 1800  # 失败后等待时间（秒）
   request_max_retries: 3     # 单次请求最大重试次数
   request_retry_base: 5      # 退避基数（秒），实际等待：5, 10, 20 ...
+
+xpropagator:
+  enabled: true              # 是否启用 xpropagator 残差分析
+  host: localhost            # xpropagator gRPC 服务地址
+  port: 50051                # xpropagator gRPC 服务端口
+  maneuver_threshold_km: 5.0 # 机动判定阈值（km），残差超过此值视为真实机动

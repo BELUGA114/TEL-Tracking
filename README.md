@@ -1,34 +1,25 @@
 # Space-Track TLE Monitor
 
-> **项目声明**
->
-> 这个项目是一个：
-> **轻量级空间目标监控工具（小玩具版SSA）**
->
-> **仅适合爱好者个人使用**
->
-> 如果你对轨道、航天或者数据监控感兴趣，可以随意改造扩展
+一个面向 Space-Track.org 的轻量级轨道监控脚本，用于：
 
----
-
-一个面向 **Space-Track.org** 的轻量级轨道监控脚本，用于：
-
-* 监控单颗或多颗卫星的 **TLE 更新**
-* 自动检测轨道变化（基于哈希比对）
-* 输出轨道参数变化（近地点 / 远地点等）
-* 附带一个**极其简化的再入时间估算（仅供参考）**
+- 监控单颗或多颗卫星的 TLE 更新
+- 自动检测轨道变化（基于哈希比对）
+- 输出轨道参数变化（近地点 / 远地点等）
+- 附带简化的再入时间估算（仅供参考）
 
 ---
 
 ## 特性
 
-* **严格遵循 Space-Track API 速率限制**（每小时 1 次 gp 查询）
-* **智能调度系统**：同时考虑调度时刻和速率限制，确保永远合规
-* **批量拉取 + 本地筛选**：避开整点/半点高峰期，节省带宽，符合官方推荐
-* **TLE 变化分类**：自动区分解算修正（Correction）与真实机动（Maneuver）
-* **断点恢复机制**：程序崩溃后自动从缓存恢复未处理数据，避免数据丢失
-* **双日志系统**：轨道数据文件（带 `change_type` 标记）+ 运行日志（JSONL，带轮转保护）
-* **重启自动恢复状态**：从历史数据恢复上次轨道状态，避免误判“首次变化”
+- 严格遵循 Space-Track API 速率限制（每小时 1 次 gp 查询）
+- 智能调度系统：同时考虑调度时刻和速率限制
+- 批量拉取 + 本地筛选：避开整点/半点高峰期
+- TLE 变化分类：区分解算修正（Correction）与真实机动（Maneuver）
+  - 默认使用简单的近地点/远地点阈值规则
+  - 可选启用高精度残差分析（依靠 xpropagator 服务）
+- 断点恢复机制：程序崩溃后自动从缓存恢复未处理数据
+
+- 重启自动恢复状态：从历史数据恢复上次轨道状态
 
 
 ---
@@ -86,8 +77,9 @@ schedule:
   minute: 17  # 每小时第 17 分钟请求数据（避开整点/半点高峰）
 
 alerts:
-  reentry_warning_km: 200     # 近地点低于 200km 时发出预警
-  only_print_on_update: true  # 只在 TLE 变化时打印，避免刷屏
+  reentry_warning_km: 200                          # 近地点低于 200km 时发出预警
+  only_print_on_update: true                       # 只在 TLE 变化时打印，避免刷屏
+  fallback_maneuver_threshold_km: 5.0              # 降级策略机动判定阈值（km）
 ```
 
 **常用配置说明**：
@@ -99,7 +91,41 @@ alerts:
 
 ---
 
-### 4. 运行脚本
+### 4. （可选）配置 xpropagator 残差分析
+
+如需启用高精度的轨道预报残差分析功能，需要先部署 xpropagator 服务。
+
+**步骤 1：安装 gRPC 依赖**
+
+```bash
+pip install grpcio grpcio-tools
+```
+
+**步骤 2：部署 xpropagator 服务**
+
+参见下方的 [轨道预报后端 (xpropagator)](#轨道预报后端-xpropagator) 章节。
+
+**步骤 3：启用配置**
+
+在 `config.yaml` 中添加：
+
+```yaml
+xpropagator:
+  enabled: true              # 启用残差分析
+  host: localhost            # xpropagator 服务地址（根据实际部署修改）
+  port: 50051                # gRPC 端口（根据实际部署修改）
+  maneuver_threshold_km: 5.0 # 机动判定阈值（km）
+```
+
+**说明：**
+- 如果不配置 xpropagator，脚本会自动降级到简单的近地点/远地点阈值规则
+- 残差分析是可选功能，不影响核心监控功能
+- 降级策略的阈值可通过 `alerts.fallback_maneuver_threshold_km` 配置（默认 5.0 km）
+
+
+---
+
+### 5. 运行脚本
 
 在项目目录下运行：
 
@@ -144,8 +170,9 @@ files:
   max_log_size_mb: 10         # 日志轮转阈值（MB）
 
 alerts:
-  reentry_warning_km: 200     # 再入预警阈值（km）
-  only_print_on_update: true  # 仅在 TLE 变化时打印
+  reentry_warning_km: 200                          # 再入预警阈值（km）
+  only_print_on_update: true                       # 仅在 TLE 变化时打印
+  fallback_maneuver_threshold_km: 5.0              # 降级策略机动判定阈值（km）
 
 retry:
   login_max_failures: 5       # 登录最大失败次数
@@ -215,31 +242,50 @@ retry:
 
 ---
 
-## 关于再入预测（非常重要）
+## 轨道预报后端 (xpropagator)
 
-> **本项目中的再入时间估算极其粗糙，仅供娱乐参考**
+### 重要声明
 
-当前实现：
+**本仓库不包含或分发来自 Space-Track.org 的官方 USSF SGP4/SGP4-XP 二进制文件。**
 
-* 使用 **BSTAR + 简化指数大气模型**
-* 通过轨道平均运动变化率进行估算
-* **忽略了大量关键因素**（姿态、太阳活动、空间天气等）
+本项目的精密轨道预报由外部 **xpropagator** 服务提供，该服务基于
+Space-Track.org 官方发布的 SGP4/SGP4-XP 动态库，但 **xpropagator 本身同样不集成这些库**。
 
-实际**误差可能达到数倍甚至更大**，不适用于任何严肃分析或决策
+TEL-Tracking 仅通过网络 gRPC 调用外部 xpropagator 服务，项目本身不含任何 SGP4 源码或编译产物
+
+如需使用高精度残差分析功能，请自行部署 xpropagator 服务。
+
+详细部署说明请参考 [xpropagator 官方仓库](https://github.com/xpropagation/xpropagator)。
+
+### 残差分析原理
+
+当检测到 TLE 更新时：
+
+1. **旧 TLE 向前传播**：将旧 TLE 传播到新 TLE 的历元时刻
+2. **新 TLE 初始化**：在新历元时刻初始化新 TLE
+3. **计算残差**：在 ECI 笛卡尔坐标系中计算位置差（km）
+4. **判定规则**：
+   - 残差 >= 机动判定阈值 → 真实机动（Maneuver）
+   - 残差 < 机动判定阈值 → 解算修正（Correction）
+
+这种方法比直接比较轨道根数更准确，因为基于 USSF 官方 SGP4-XP 模型，
+在状态空间比较，消除了轨道根数解算的舍入误差。
 
 ---
 
-### 如果你需要更专业的衰减预报：
+## 关于再入预测
 
-推荐使用以下方案：
+本项目中的再入时间估算极其粗糙，仅供娱乐参考。
 
-* 专业轨道传播器：如 SGP4 / SGP4‑XP 的官方实现
-* 高精度大气模型：如 NRLMSISE‑00
-* 数值积分与动力学建模
+当前实现：
 
-一个可参考的开源项目是 **[xpropagator](https://github.com/xpropagation/xpropagator)**。它是一个将美国太空军官方 SGP4/SGP4‑XP 
-封装为 gRPC 服务的轨道传播工具，支持：单点传播与星历生成，编目级卫星批量处理，内置内存管理与并发控制。  
-该服务**精度远高于一般开源实现**，尤其适合对中高轨卫星的长期预报。你可以将其部署为独立服务，并通过 gRPC 接口获得高精度的轨道状态数据，用于再入分析或衰减趋势判断。
+- 使用 BSTAR + 简化指数大气模型
+- 通过轨道平均运动变化率进行估算
+- 忽略了大量关键因素（姿态、太阳活动、空间天气等）
+
+实际误差可能达到数倍甚至更大，不适用于任何严肃分析或决策。
+
+如需更专业的衰减预报，推荐使用专业轨道传播器（如 SGP4/SGP4-XP）和高精度大气模型（如 NRLMSISE-00）。
 
 ---
 
@@ -263,10 +309,12 @@ retry:
 }
 ```
 
-**change_type 字段说明**：
-- `initial`: 首次记录
-- `correction`: 解算修正（近地点/远地点变化 < 5 km）
-- `maneuver`: 真实机动（近地点/远地点变化 > 5 km）
+**change_type 字段说明：**
+- initial: 首次记录
+- correction: 解算修正（近地点/远地点变化 < 阈值）
+- maneuver: 真实机动（近地点/远地点变化 > 阈值）
+
+阈值可通过 `alerts.fallback_maneuver_threshold_km` 配置（默认 5.0 km）
 
 可用于：轨道趋势分析，机动事件检测（直接过滤出 `change_type == "maneuver"`），数据归档与可视化等
 
@@ -274,38 +322,36 @@ retry:
 
 ## 注意事项
 
-
-本项目严格遵守 Space-Track.org 的 API 使用规范：
+本项目严格遵守 Space-Track.org 的 API 使用规范。
 
 ### 速率限制
 
-每小时仅允许向 `gp` 类端点发起 1 次请求，违规会导致账号被封
+每小时仅允许向 gp 类端点发起 1 次请求，违规会导致账号被封。
 
 ### 推荐的查询方式
 
-不应针对单个 NORAD ID 频繁查询，而应使用批量查询获取过去一小时内发布的所有 TLE，然后在本地筛选目标卫星：
+不应针对单个 NORAD ID 频繁查询，而应使用批量查询获取过去一小时内发布的所有 TLE，然后在本地筛选目标卫星。
 
 ```
 https://www.space-track.org/basicspacedata/query/class/gp/decay_date/null-val/CREATION_DATE/%3Enow-0.042/format/json
 ```
 
 该查询会返回：
-- 所有未衰减的卫星（`decay_date/null-val`）
-- 在过去 1 小时内发布的 TLE（`CREATION_DATE/%3Enow-0.042`，0.042天 ≈ 1小时）
+- 所有未衰减的卫星（decay_date/null-val）
+- 在过去 1 小时内发布的 TLE（CREATION_DATE/%3Enow-0.042，0.042天约等于1小时）
 - JSON 格式输出（便于本地处理）
 
 ### 调度时间要求
 
-- **避开整点和半点高峰期**（如 09:00、09:30 不可用），建议使用非高峰时段（如 09:12、09:48）
-- 本脚本默认设置为每小时第 12 分钟执行 
+- 避开整点和半点高峰期（如 09:00、09:30），建议使用非高峰时段（如 09:12、09:48）
+- 本脚本默认设置为每小时第 17 分钟执行 
 
-### *请勿修改调度逻辑以规避速率限制*
+### 请勿修改调度逻辑以规避速率限制
 
 ---
 
 ## 相关链接
+
 - [Space-Track.org](https://www.space-track.org/)
-- [GP 类文档](https://www.space-track.org/documentation#api-basicSpaceDataGP)
-- [API 限制和完整文档](https://www.space-track.org/documentation#/api)
-- [SGP4/SGP4-XP](https://www.celestrak.com/software/vallado-sw.php)
+- [API 文档](https://www.space-track.org/documentation#/api)
 - [xpropagator](https://github.com/xpropagation/xpropagator)

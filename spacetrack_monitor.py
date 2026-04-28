@@ -36,7 +36,7 @@ try:
 except ImportError:
     _XPROP_MODULE_OK = False
     classify_change_xprop = None   # type: ignore 忽略
-    is_service_alive       = None  # type: ignore 忽略
+    is_service_alive = None  # type: ignore 忽略
 
 load_dotenv()
 
@@ -92,6 +92,8 @@ XPROP_ENABLED: bool = _xprop_cfg.get("enabled", True)
 XPROP_HOST: str = _xprop_cfg.get("host", "localhost")
 XPROP_PORT: int = _xprop_cfg.get("port", 50051)
 XPROP_MANEUVER_THRESHOLD_KM: float = _xprop_cfg.get("maneuver_threshold_km", 5.0)
+# 降级策略配置（当 xpropagator 不可用时使用）
+FALLBACK_MANEUVER_THRESHOLD_KM: float = _cfg.get("alerts", {}).get("fallback_maneuver_threshold_km", 5.0)
 
 # 实际是否可用 = 配置开启 + 模块导入成功
 XPROP_ACTIVE: bool = XPROP_ENABLED and _XPROP_MODULE_OK
@@ -544,10 +546,10 @@ def classify_change(orbit: dict, prev: Optional[dict]) -> str:
         # RPC 调用失败（服务暂时不可用），降级处理
         log.debug("[%d] xpropagator 本次调用失败，降级到简单阈值", orbit["norad"])
 
-    # 降级路径：简单近地点/远地点阈值（原逻辑）
+    # 降级路径：简单近地点/远地点阈值
     delta_peri = abs(orbit["periapsis"] - prev["periapsis"])
     delta_apo = abs(orbit["apoapsis"] - prev["apoapsis"])
-    if delta_peri > 5.0 or delta_apo > 5.0:
+    if delta_peri > FALLBACK_MANEUVER_THRESHOLD_KM or delta_apo > FALLBACK_MANEUVER_THRESHOLD_KM:
         return "maneuver"
     return "correction"
 
