@@ -262,7 +262,7 @@ def is_service_alive(host: str = XPROP_HOST, port: int = XPROP_PORT) -> bool:
         log.info("xpropagator 已连接：%s %s", resp.name, resp.version)
         return True
     except Exception as exc:
-        log.debug("xpropagator 服务探活失败: %s", exc)
+        log.warning("xpropagator 服务探活失败: %s", exc)
         return False
 
 def _tle_checksum(line: str) -> int:

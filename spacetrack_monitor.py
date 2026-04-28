@@ -29,14 +29,12 @@ from typing import Optional
 import requests
 import yaml
 
-# xpropagator 客户端（插件式，找不到模块时自动禁用）
-try:
-    from xpropagator_client import classify_change_xprop, is_service_alive
-    _XPROP_MODULE_OK = True
-except ImportError:
-    _XPROP_MODULE_OK = False
-    classify_change_xprop = None   # type: ignore 忽略
-    is_service_alive = None  # type: ignore 忽略
+# 初始化日志系统（必须在配置加载之前）
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
 
 load_dotenv()
 
@@ -95,9 +93,6 @@ XPROP_MANEUVER_THRESHOLD_KM: float = _xprop_cfg.get("maneuver_threshold_km", 5.0
 # 降级策略配置（当 xpropagator 不可用时使用）
 FALLBACK_MANEUVER_THRESHOLD_KM: float = _cfg.get("alerts", {}).get("fallback_maneuver_threshold_km", 5.0)
 
-# 实际是否可用 = 配置开启 + 模块导入成功
-XPROP_ACTIVE: bool = XPROP_ENABLED and _XPROP_MODULE_OK
-
 # 以下参数涉及 API 合规，不暴露在 config.yaml 中，避免用户误改导致封号
 MIN_REQUEST_INTERVAL: int = 3600   # 两次请求最小间隔（秒），勿修改
 SESSION_MAX_AGE: int = 5400   # 会话最长有效期（秒），勿修改
@@ -127,12 +122,22 @@ BULK_TLE_URL = (
     "/format/json"
 )
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
+# 确保 xpropagator_client 模块的 logger 也能输出 INFO 级别日志
+logging.getLogger("xpropagator_client").setLevel(logging.INFO)
+
 log = logging.getLogger(__name__)
+
+# xpropagator 客户端（插件式，找不到模块时自动禁用）
+try:
+    from xpropagator_client import classify_change_xprop, is_service_alive
+    _XPROP_MODULE_OK = True
+except ImportError:
+    _XPROP_MODULE_OK = False
+    classify_change_xprop = None   # type: ignore 忽略
+    is_service_alive = None  # type: ignore 忽略
+
+# 实际是否可用 = 配置开启 + 模块导入成功
+XPROP_ACTIVE: bool = XPROP_ENABLED and _XPROP_MODULE_OK
 
 
 def rotate_file_if_needed(filepath: str, max_size: int = MAX_LOG_SIZE) -> None:
@@ -351,7 +356,7 @@ class SpaceTrackSession:
             return False
 
         if self._check_login_response(resp):
-            log.info("登录成功")
+            log.debug("登录成功")
             self._login_failures = 0
             self._logged_in_at = time.monotonic()
             return True
@@ -456,7 +461,7 @@ def fetch_bulk_tle(st: SpaceTrackSession) -> "list[dict] | FetchStatus":
     except ValueError as e:
         log.warning("JSON 解析失败: %s", e)
         return FetchStatus.SKIP
-    log.info("收到 %d 条记录", len(data))
+    log.debug("收到 %d 条记录", len(data))
     return data
 
 
