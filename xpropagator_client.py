@@ -122,8 +122,6 @@ def propagate_tle(
     调用 xpropagator Prop RPC，将 TLE 传播到 target_time（UTC）。
     返回：ECI 状态向量（km / km·s⁻¹），失败时返回 None。
     每次调用都创建新 channel（满足插件式/无状态设计，避免长连接管理）。
-    
-    注意：使用唯一 norad_id + req_id 组合以绕过服务端缓存机制。
     """
     if not _GRPC_AVAILABLE:
         return None
@@ -135,10 +133,17 @@ def propagate_tle(
         )
         stub = pb2_grpc.PropagatorStub(channel)
 
-        # 生成唯一标识以绕过服务端缓存
-        # 使用时间戳微秒级 + TLE 哈希作为虚拟 norad_id
-        virtual_norad = abs(hash((tle1, tle2, target_time.isoformat()))) % 900000 + 100000
-        req_id = int(time.time() * 1000000)
+        # 生成随机伪 NORAD ID（80000-99999 范围，避免与真实卫星冲突）
+        # 稳定版（相同TLE复用缓存，节省内存）
+        fake_id = 80000 + (hash(tle1 + tle2) % 20000)
+
+        # 绝对防缓存版（每次都不同，需配合定期重启清理累积对象）
+        # fake_id = 80000 + int(time.time() * 1000) % 20000
+
+        spoof_tle1, spoof_tle2 = _spoof_catalog_id(tle1, tle2, fake_id)
+
+        # req_id 使用时间戳 + 真实 NORAD ID + 伪 ID（确保唯一性且为整数）
+        req_id = int(time.time() * 1000000) + norad_id * 100000 + fake_id
         
         request = prop_pb2.PropRequest(
             req_id=req_id,
@@ -146,10 +151,10 @@ def propagate_tle(
             task=prop_pb2.PropTask(
                 time_utc=_dt_to_pb_timestamp(target_time),
                 sat=common_pb2.Satellite(  # ← 从 common_pb2 取
-                    norad_id=virtual_norad,  # 使用虚拟 NORAD ID 强制创建新实例
+                    norad_id=fake_id,  # 使用伪 ID 绕过缓存
                     name=name,
-                    tle_ln1=tle1,
-                    tle_ln2=tle2,
+                    tle_ln1=spoof_tle1,   # 使用替换后的 TLE
+                    tle_ln2=spoof_tle2,
                 ),
             ),
         )
@@ -203,21 +208,24 @@ def classify_change_xprop(
     if epoch_dt is None:
         return None
 
-    norad_id = orbit["norad"]
-    name     = orbit.get("name", "")
-
-    # ① 旧 TLE 预报到新历元 → "如果没有机动，卫星应在哪里"
+    # 旧 TLE 预报到新历元 → "如果没有机动，卫星应在哪里"
+    # 使用 prev 的卫星标识（NORAD ID 和名称）
+    prev_norad = prev["norad"]
+    prev_name = prev.get("name", "")
     sv_predicted = propagate_tle(
-        norad_id, name,
+        prev_norad, prev_name,
         prev["tle1"], prev["tle2"],
         epoch_dt, host, port,
     )
     if sv_predicted is None:
         return None
 
-    # ② 新 TLE 在其历元时刻的初始状态（MSE=0 点，即 TLE 定义的参考状态）
+    # 新 TLE 在其历元时刻的初始状态（MSE=0 点，即 TLE 定义的参考状态）
+    # 使用 orbit 的卫星标识（NORAD ID 和名称）
+    orbit_norad = orbit["norad"]
+    orbit_name = orbit.get("name", "")
     sv_new_epoch = propagate_tle(
-        norad_id, name,
+        orbit_norad, orbit_name,
         orbit["tle1"], orbit["tle2"],
         epoch_dt, host, port,
     )
@@ -228,8 +236,9 @@ def classify_change_xprop(
     verdict  = "maneuver" if delta_km >= maneuver_threshold_km else "correction"
 
     log.info(
-        "[%d] xprop 残差 @ %s：Δr = %.3f km（阈值 %.1f km）→ %s",
-        norad_id,
+        "[%d→%d] xprop 残差 @ %s：Δr = %.3f km（阈值 %.1f km）→ %s",
+        prev_norad,
+        orbit_norad,
         epoch_dt.strftime("%Y-%m-%dT%H:%MZ"),
         delta_km,
         maneuver_threshold_km,
@@ -255,3 +264,46 @@ def is_service_alive(host: str = XPROP_HOST, port: int = XPROP_PORT) -> bool:
     except Exception as exc:
         log.debug("xpropagator 服务探活失败: %s", exc)
         return False
+
+def _tle_checksum(line: str) -> int:
+    """计算 TLE 行校验位（末位数字）"""
+    total = 0
+    for ch in line[:-1]:  # 不含最后一位
+        if ch.isdigit():
+            total += int(ch)
+        elif ch == '-':
+            total += 1
+    return total % 10
+
+
+"""
+服务端的 satKey 就是 TLE 第一行的卫星编号，不是 TLE 内容的哈希
+同一编号第一次加载后就常驻缓存，后续传入再不同的 TLE 都被忽略
+这个设计对长期追踪同一颗卫星合理，但对用两组不同 TLE 做残差比较完全不可用
+"""
+
+# 没有办法的办法：使用 fake_id fake_name 创建一个临时的 TLE
+def _spoof_catalog_id(tle1: str, tle2: str, fake_id: int) -> tuple[str, str]:
+    """
+    把 TLE 两行里的卫星编号替换为 fake_id，并重算校验位。
+    增加防御：确保行长度为 69 字符。
+    """
+    # 防御：去除首尾空白，截断为 69 字符
+    tle1 = tle1.strip()[:69]
+    tle2 = tle2.strip()[:69]
+
+    id_str = f"{fake_id:5d}"  # 5位右对齐
+
+    # 替换 line1 卫星编号（列2-6）并重算校验位
+    l1 = list(tle1)
+    l1[2:7] = list(id_str)
+    l1[68] = str(_tle_checksum("".join(l1)))
+    new_tle1 = "".join(l1)
+
+    # 替换 line2 卫星编号（列2-6）并重算校验位
+    l2 = list(tle2)
+    l2[2:7] = list(id_str)
+    l2[68] = str(_tle_checksum("".join(l2)))
+    new_tle2 = "".join(l2)
+
+    return new_tle1, new_tle2
