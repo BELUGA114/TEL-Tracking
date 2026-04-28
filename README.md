@@ -1,9 +1,380 @@
 # Space-Track TLE Monitor
 
+<a id="language-selector"></a>
+**Language / 语言**: [🇺🇸 English](#english-version) | [🇨🇳 中文](#chinese-version)
+
+---
+
+<a id="english-version"></a>
+
+A lightweight orbital monitoring script for Space-Track.org that provides:
+
+- Monitoring of single or multiple satellites' TLE updates
+- Automatic detection of orbital changes and distinction between solution corrections and real maneuvers (based on hash comparison)
+- Output of orbital parameter changes (perigee/apogee, etc.)
+- Simplified reentry time estimation (for reference only)
+
+---
+
+## Features
+
+- Strictly follows Space-Track API rate limits (1 gp query per hour)
+- Intelligent scheduling system: considers both scheduled time and rate limits
+- Batch fetching + local filtering: avoids peak hours at :00 and :30
+- TLE change classification: distinguishes between solution corrections and real maneuvers
+  - Default simple threshold rules based on perigee/apogee
+  - Optional high-precision residual analysis (requires xpropagator service)
+- Breakpoint recovery mechanism: automatically recovers unprocessed data from cache after program crash
+
+- Automatic state recovery on restart: restores last orbital state from historical data
+
+
+---
+
+## Quick Start
+
+### 1. Install Python Dependencies
+
+Make sure you have Python installed, then run in the project directory:
+
+```bash
+pip install requests python-dotenv
+```
+
+---
+
+### 2. Configure Space-Track Account
+
+**Step 1: Copy template file**
+
+Copy `.env.example` and rename it to `.env`:
+
+```bash
+cp .env.example .env
+```
+
+**Step 2: Fill in credentials**
+
+Open the `.env` file with a text editor and enter your Space-Track account credentials:
+
+```env
+SPACETRACK_USER=your_email@example.com
+SPACETRACK_PASS=your_password
+```
+
+
+> - The `.env` file contains your account credentials, do not share it with others
+> - If you don't have a Space-Track account, register at [space-track.org](https://www.space-track.org) first
+
+---
+
+### 3. Configure Monitoring Targets
+
+If you want to modify the monitored satellites or adjust other parameters, edit the `config.yaml` file
+
+**Simplest usage**: If you only want to monitor ISS, use the default configuration without modification
+
+**Custom configuration example**:
+
+```yaml
+targets:
+  norad_ids: [25544, 48273]  # Monitor multiple satellites, separated by commas
+
+schedule:
+  minute: 17  # Request data at the 17th minute of each hour (avoid peak hours at :00 and :30)
+
+alerts:
+  reentry_warning_km: 200                          # Warning when perigee is below 200km
+  only_print_on_update: true                       # Only print when TLE changes to avoid spam
+  fallback_maneuver_threshold_km: 5.0              # Fallback strategy maneuver detection threshold (km)
+```
+
+**Common configuration explanations**:
+- `norad_ids`: List of satellite NORAD IDs to monitor, can be queried at [space-track.org](https://www.space-track.org)
+- `minute`: Minute of each hour to request data, recommended values are 12, 17, 42, 48, etc., avoiding 0 and 30
+- `only_print_on_update`: Set to `true` to reduce console output, only display when there are updates
+
+> **Tip**: Restart the script after modifying `config.yaml` for changes to take effect
+
+---
+
+### 4. (Optional) Configure xpropagator Residual Analysis
+
+To enable high-precision orbital prediction residual analysis, you need to deploy the xpropagator service first.
+
+**Step 1: Install gRPC dependencies**
+
+```bash
+pip install grpcio grpcio-tools
+```
+
+**Step 2: Deploy xpropagator service**
+
+See the [Orbital Prediction Backend (xpropagator)](#orbital-prediction-backend-xpropagator) section below.
+
+**Step 3: Enable configuration**
+
+Add to `config.yaml`:
+
+```yaml
+xpropagator:
+  enabled: true              # Enable residual analysis
+  host: localhost            # xpropagator service address (modify according to actual deployment)
+  port: 50051                # gRPC port (modify according to actual deployment)
+  maneuver_threshold_km: 5.0 # Maneuver detection threshold (km)
+```
+
+**Notes:**
+- If xpropagator is not configured, the script will automatically fall back to simple perigee/apogee threshold rules
+- Residual analysis is an optional feature and does not affect core monitoring functionality
+- Fallback strategy threshold can be configured via `alerts.fallback_maneuver_threshold_km` (default 5.0 km)
+
+
+---
+
+### 5. Run the Script
+
+Run in the project directory:
+
+```bash
+python spacetrack_monitor.py
+```
+
+On first run, the script will:
+1. Load your account configuration
+2. Log in to Space-Track
+3. Execute the first data fetch immediately
+4. Automatically check once every hour thereafter
+
+Successful execution shows output similar to:
+
+```
+2026-04-27 21:31:54 Space-Track Orbital Monitor
+2026-04-27 21:31:54 Config file: config.yaml | Credentials: .env
+2026-04-27 21:31:54 Target: 25544
+2026-04-27 21:31:54 Schedule: Every hour at minute 17 | Reentry warning: <200 km
+```
+
+---
+
+## Configuration Details
+
+### Business Configuration (config.yaml)
+
+Parameters are located in `config.yaml`, restart the script after modification:
+
+```yaml
+targets:
+  norad_ids: [25544]          # Monitoring targets (NORAD ID list)
+
+schedule:
+  minute: 12                  # Minute of each hour to request data (recommended 12 or 48)
+
+files:
+  data_file: tle_data.jsonl   # Orbital data file
+  cache: tle_cache.json       # Temporary cache file
+  run_log: tle_log.jsonl      # Runtime log file
+  max_log_size_mb: 10         # Log rotation threshold (MB)
+
+alerts:
+  reentry_warning_km: 200                          # Reentry warning threshold (km)
+  only_print_on_update: true                       # Print only when TLE changes
+  fallback_maneuver_threshold_km: 5.0              # Fallback strategy maneuver detection threshold (km)
+
+retry:
+  login_max_failures: 5       # Maximum login failure attempts
+  login_pause_seconds: 1800   # Wait time after login failure (seconds)
+  request_max_retries: 3      # Maximum request retry attempts
+  request_retry_base: 5       # Exponential backoff base (seconds)
+```
+
+### Data Files
+
+The following files are automatically generated after running the script:
+
+- **tle_data.jsonl**: Core orbital data (recorded on each TLE update), each record includes `change_type` field (initial/correction/maneuver) for easy post-processing filtering of real maneuver events, with rotation protection
+- **tle_cache.json**: Temporary cache, saves last request time, full raw data and pending processing flags, supports breakpoint recovery, automatically overwritten
+- **tle_log.jsonl**: Runtime logs, records program operation status, with rotation protection
+
+> **Log Rotation**: When file size exceeds the configured threshold (default 10MB), it will be automatically renamed to `.bak` backup file.
+
+---
+
+## Output Examples
+
+### Console Output
+
+```text
+2026-04-27 14:12:01 [25544] This batch has 3 solution records, taking the latest one
+2026-04-27 14:12:01 [25544] TLE change detected! (hash: abc123 → def456, type: Solution Correction (Correction))
+
+  ===============================================
+    ISS (ZARYA)          NORAD 25544
+    International Designator: 1998-067A
+    Epoch:     2026-04-27T14:08:32
+    Perigee:   418.5 km    Apogee: 421.2 km
+    Inclination: 51.6400°   Period: 92.870 min
+    Eccentricity: 0.0002000   BSTAR: 2.3456e-04
+    TLE Hash: abcdef1234567890
+  ===============================================  (Perigee +0.3 km, Apogee +0.2 km)
+  1 25544U 98067A   ...
+  2 25544  51.6400 ...
+```
+
+### Seemingly Anomalous Wait Times? (Actually Expected Behavior)
+
+Example:
+```text
+2026-04-25 00:30:13 Next query: 02:12 UTC (in 102 minutes)
+```
+
+**Why does "102 minutes" appear?**
+
+This is **expected normal behavior**, caused by the script's strict adherence to Space-Track API regulations:
+
+1. **Current time**: 00:30, just completed a fetch
+2. **Next scheduled time**: 01:12 (42 minutes from now)
+3. **Rate limit requirement**: Must wait 60 minutes since last request (can only make legal requests after 01:30)
+4. **Conflict resolution**: 01:12 < 01:30, Space-Track doesn't want us requesting during peak hours at :00 and :30, so postponed to next scheduled time 02:12
+5. **Final wait time**: 02:12 - 00:30 = **102 minutes**
+
+> **Scheduling is always predictable and always compliant for long-term benefits**
+>
+> The script prefers to wait longer rather than violate API regulations. This conservative strategy aims to ensure:
+> Account safety (won't be banned for violations),
+> Data reliability (each fetch occurs within legal time windows),
+> Long-term stability (can run continuously for months or even years)
+
+
+
+---
+
+## Orbital Prediction Backend (xpropagator)
+
+### Important Notice
+
+**This repository does not contain or distribute official USSF SGP4/SGP4-XP binary files from Space-Track.org.**
+
+Precise orbital prediction for this project is provided by external **xpropagator** service, which is based on
+Space-Track.org officially released SGP4/SGP4-XP dynamic libraries, but **xpropagator itself also does not integrate these libraries**.
+
+TEL-Tracking only calls external xpropagator service via network gRPC, the project itself contains no SGP4 source code or compiled artifacts
+
+To use high-precision residual analysis functionality, please deploy xpropagator service yourself.
+
+For detailed deployment instructions, refer to the [xpropagator official repository](https://github.com/xpropagation/xpropagator).
+
+### Residual Analysis Principle
+
+When TLE update is detected:
+
+1. **Old TLE forward propagation**: Propagate old TLE to new TLE's epoch time
+2. **New TLE initialization**: Initialize new TLE at new epoch time
+3. **Calculate residuals**: Compute position difference in ECI Cartesian coordinates (km)
+4. **Decision rules**:
+   - Residual >= maneuver threshold → Real maneuver (Maneuver)
+   - Residual < maneuver threshold → Solution correction (Correction)
+
+This method is more accurate than directly comparing orbital elements, as it's based on USSF official SGP4-XP model,
+comparing in state space, eliminating rounding errors from orbital element solutions.
+
+---
+
+## About Reentry Prediction
+
+The reentry time estimation in this project is extremely rough, for entertainment reference only.
+
+Current implementation:
+
+- Uses BSTAR + simplified exponential atmospheric model
+- Estimates through orbital mean motion change rate
+- Ignores many critical factors (attitude, solar activity, space weather, etc.)
+
+Actual errors may reach several times or more, not suitable for any serious analysis or decision-making.
+
+For more professional decay forecasting, recommend using professional orbital propagators (such as SGP4/SGP4-XP) and high-precision atmospheric models (such as NRLMSISE-00).
+
+---
+
+## Data Format (JSONL)
+
+### Orbital Data File (tle_data.jsonl)
+
+Each TLE update records complete orbital parameters and change type:
+
+```json
+{
+  "timestamp": "2026-04-27T14:12:01.123456+00:00",
+  "change_type": "correction",
+  "norad": 25544,
+  "name": "ISS (ZARYA)",
+  "periapsis": 418.5,
+  "apoapsis": 421.2,
+  "epoch": "2026-04-27T14:08:32+00:00",
+  "tle_hash": "abcdef1234567890",
+  ...
+}
+```
+
+**change_type field explanation:**
+- initial: First record
+- correction: Solution correction (perigee/apogee change < threshold)
+- maneuver: Real maneuver (perigee/apogee change > threshold)
+
+Threshold can be configured via `alerts.fallback_maneuver_threshold_km` (default 5.0 km)
+
+Can be used for: orbital trend analysis, maneuver event detection (directly filter out `change_type == "maneuver"`), data archiving and visualization, etc.
+
+---
+
+## Important Notes
+
+This project strictly complies with Space-Track.org API usage specifications.
+
+### Rate Limits
+
+Only 1 request per hour is allowed to gp endpoints, violations will result in account suspension.
+
+### Recommended Query Method
+
+Should not frequently query individual NORAD IDs, instead use batch queries to get all TLEs published in the past hour, then filter target satellites locally.
+
+```
+https://www.space-track.org/basicspacedata/query/class/gp/decay_date/null-val/CREATION_DATE/%3Enow-0.042/format/json
+```
+
+This query returns:
+- All non-decayed satellites (decay_date/null-val)
+- TLEs published in the past 1 hour (CREATION_DATE/%3Enow-0.042, 0.042 days ≈ 1 hour)
+- JSON format output (convenient for local processing)
+
+### Scheduling Time Requirements
+
+- Avoid peak hours at :00 and :30 (such as 09:00, 09:30), recommend using off-peak times (such as 09:12, 09:48)
+- This script defaults to executing at the 17th minute of each hour 
+
+### Do Not Modify Scheduling Logic to Circumvent Rate Limits
+
+---
+
+## Related Links
+
+- [Space-Track.org](https://www.space-track.org/)
+- [API Documentation](https://www.space-track.org/documentation#/api)
+- [xpropagator](https://github.com/xpropagation/xpropagator)
+
+---
+
+<a id="chinese-version"></a>
+
+# Space-Track TLE Monitor (中文版)
+
+> **注意**: 这是中文版本。如需英文版本，请查看上方的 [English Version](#english-version)。
+
 一个面向 Space-Track.org 的轻量级轨道监控脚本，用于：
 
 - 监控单颗或多颗卫星的 TLE 更新
-- 自动检测轨道变化（基于哈希比对）
+- 自动检测轨道变化并分辨解算修正与真实机动（基于哈希比对）
 - 输出轨道参数变化（近地点 / 远地点等）
 - 附带简化的再入时间估算（仅供参考）
 
@@ -355,3 +726,7 @@ https://www.space-track.org/basicspacedata/query/class/gp/decay_date/null-val/CR
 - [Space-Track.org](https://www.space-track.org/)
 - [API 文档](https://www.space-track.org/documentation#/api)
 - [xpropagator](https://github.com/xpropagation/xpropagator)
+
+---
+
+[↑ Back to Top / 返回顶部](#language-selector)
