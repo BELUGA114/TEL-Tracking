@@ -1,6 +1,13 @@
 # Space-Track TLE 监控配置
 # 密钥（账号密码）请在 .env 文件中填写，不要写在这里
 
+# User-Agent 配置（可选）
+# Space-Track 和 CelesTrak 不强制要求 User-Agent，但建议填写以标识应用身份
+# 格式建议："项目名称/版本 (联系方式)"
+# 例如："MySatTracker/1.0 (user@example.com)"
+# 留空则不发送 User-Agent 头部
+user_agent: ""
+
 targets:
   # 监控目标的 NORAD 编号，多个用逗号分隔
   norad_ids: [25544]
@@ -32,3 +39,11 @@ xpropagator:
   host: localhost            # xpropagator gRPC 服务地址
   port: 50051                # xpropagator gRPC 服务端口
   maneuver_threshold_km: 5.0 # 机动判定阈值（km），残差超过此值视为真实机动
+
+# 双源数据接入配置
+data_source:
+  primary: "celestrak"         # 主数据源: "celestrak" | "spacetrack"
+  fallback: "spacetrack"       # 备源: "spacetrack" | "celestrak" | "none"
+  fallback_threshold: 3        # 主源连续失败几次后切换备源
+  celestrak_interval_seconds: 7200   # CelesTrak 最小轮询间隔（秒），勿低于 7200
+  use_supplemental: false      # 是否同时查询 SupGP 接口（Starlink 等补充星历）

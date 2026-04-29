@@ -18,7 +18,6 @@ import hashlib
 import json
 import logging
 import math
-import sys
 import time
 import os
 from dotenv import load_dotenv
@@ -28,6 +27,14 @@ from typing import Optional
 
 import requests
 import yaml
+
+# CelesTrak 拉取模块（可选，主源为 celestrak 时启用）
+try:
+    import celestrak_fetcher as ct
+    _CT_MODULE_OK = True
+except ImportError:
+    ct = None           # type: ignore
+    _CT_MODULE_OK = False
 
 # 初始化日志系统（必须在配置加载之前）
 logging.basicConfig(
@@ -92,6 +99,13 @@ XPROP_PORT: int = _xprop_cfg.get("port", 50051)
 XPROP_MANEUVER_THRESHOLD_KM: float = _xprop_cfg.get("maneuver_threshold_km", 5.0)
 # 降级策略配置（当 xpropagator 不可用时使用）
 FALLBACK_MANEUVER_THRESHOLD_KM: float = _cfg.get("alerts", {}).get("fallback_maneuver_threshold_km", 5.0)
+# 双源配置
+_ds_cfg = _cfg.get("data_source", {})
+PRIMARY_SOURCE: str    = _ds_cfg.get("primary",                   "spacetrack")
+FALLBACK_SOURCE: str   = _ds_cfg.get("fallback",                  "none")
+FALLBACK_THRESHOLD: int = _ds_cfg.get("fallback_threshold",        3)
+CELESTRAK_INTERVAL: int = _ds_cfg.get("celestrak_interval_seconds", 7200)
+USE_SUPPLEMENTAL: bool  = _ds_cfg.get("use_supplemental",          False)
 
 # 以下参数涉及 API 合规，不暴露在 config.yaml 中，避免用户误改导致封号
 MIN_REQUEST_INTERVAL: int = 3600   # 两次请求最小间隔（秒），勿修改
@@ -109,6 +123,10 @@ _EPOCH_MIN = datetime(2000, 1, 1, tzinfo=timezone.utc)
 BASE_URL = "https://www.space-track.org"
 LOGIN_URL = f"{BASE_URL}/ajaxauth/login"
 LOGOUT_URL = f"{BASE_URL}/ajaxauth/logout"
+
+# User-Agent（可选，用于标识应用身份）
+# 如果用户在 config.yaml 中配置了 user_agent，则使用该值；否则不设置 UA
+SPACE_TRACK_USER_AGENT: Optional[str] = _cfg.get("user_agent") or None
 
 # 批量查询 URL：获取最近 1 小时内发布的所有 TLE
 # 这是 Space-Track 官方推荐的查询方式，符合 API 使用规范
@@ -321,6 +339,8 @@ class SpaceTrackSession:
 
     def __init__(self) -> None:
         self._session = requests.Session()
+        if SPACE_TRACK_USER_AGENT:
+            self._session.headers.update({"User-Agent": SPACE_TRACK_USER_AGENT})
         self._login_failures = 0
         self._logged_in_at: Optional[float] = None
 
@@ -392,6 +412,8 @@ class SpaceTrackSession:
             log.info("会话已存在 %.0f 分钟，主动刷新登录...", age / 60)
             self.logout()
             self._session = requests.Session()
+            if SPACE_TRACK_USER_AGENT:
+                self._session.headers.update({"User-Agent": SPACE_TRACK_USER_AGENT})
             return self.login_with_retry()
         return True
 
@@ -406,6 +428,8 @@ class SpaceTrackSession:
     def relogin(self) -> bool:
         self.logout()
         self._session = requests.Session()
+        if SPACE_TRACK_USER_AGENT:
+            self._session.headers.update({"User-Agent": SPACE_TRACK_USER_AGENT})
         return self.login_with_retry()
 
     def get(self, url: str) -> "requests.Response | FetchStatus":
@@ -654,7 +678,7 @@ def print_orbit(orbit: dict, prev: Optional[dict]) -> None:
         log.info(f"     注意：近地点 {peri:.1f} km，大气阻力明显，轨道将持续衰减")
 
 
-def log_record(orbit: dict, change_type: str = "unknown") -> None:
+def log_record(orbit: dict, change_type: str = "unknown", source: str = "spacetrack") -> None:
     """将轨道数据写入 DATA_FILE（核心业务数据）"""
     if not DATA_FILE:
         return
@@ -662,6 +686,7 @@ def log_record(orbit: dict, change_type: str = "unknown") -> None:
     entry = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "change_type": change_type,  # 变化类型：initial/correction/maneuver
+        "source": source,            # 数据来源：spacetrack / celestrak / celestrak_sup
         **orbit
     }
     try:
@@ -772,6 +797,9 @@ def process_records(
             # 本批次中没有该卫星的新 TLE
             log.info("[%d] 本批次无数据（过去 1 小时内未发布新 TLE）", norad_id)
             continue
+        
+        # 提取来源标识（确认 record 不为 None 后读取）
+        record_source = record.get("_source", "spacetrack")
 
         # 提取批次记录数（元数据，不进入 orbit）
         batch_count = record.pop("_batch_count", 1)
@@ -799,7 +827,7 @@ def process_records(
             print_orbit(orbit, prev)
             
             # 写入轨道数据文件（附带变化类型）
-            log_record(orbit, change_type)
+            log_record(orbit, change_type, source=record_source)
             
             # 更新内存中的状态（供下次比较使用）
             prev_data[norad_id] = orbit  # 更新最新轨道数据
@@ -815,153 +843,280 @@ def process_records(
     # 即使没有命中目标，也要更新时间戳，避免下次启动时重复请求
     cache.mark_fetched()
 
+def cold_start_if_needed(norad_ids: list[int], prev_data: dict[int, dict]) -> None:
+    """
+    冷启动检查：对 tle_data 中无记录的卫星，通过 CelesTrak 获取初始基准数据
+    无论 PRIMARY_SOURCE 为何值均执行，因为冷启动始终优先走 CelesTrak（无需认证）
+    """
+    missing = [nid for nid in norad_ids if nid not in prev_data]
+    if not missing:
+        return
+
+    if not _CT_MODULE_OK:
+        log.warning("冷启动：以下卫星无历史记录，但 celestrak_fetcher 模块未找到，跳过初始化: %s",
+                    missing)
+        return
+
+    log.info("冷启动：以下卫星无历史记录，将通过 CelesTrak 获取初始基准: %s", missing)
+    for nid in missing:
+        record = ct.fetch_single(nid, use_supplemental=USE_SUPPLEMENTAL)
+        if record is None:
+            log.warning("[冷启动][%d] CelesTrak 查询失败，本轮跳过", nid)
+            continue
+        orbit = parse_orbit(record)
+        log.info("[冷启动][%d] %s 初始基准已入库", nid, orbit["name"])
+        log_record(orbit, change_type="initial", source=record.get("_source", "celestrak"))
+        prev_data[nid] = orbit
+    log.info("冷启动完成")
+
+
+def run_celestrak_cycle(
+    prev_data: dict[int, dict],
+    last_hash: dict[int, str],
+    consecutive_failures: dict,
+) -> bool:
+    """
+    以 CelesTrak 为主源执行一轮监控。
+    返回 True 表示本轮至少有一次成功的网络请求，False 表示全部失败或全部跳过。
+    consecutive_failures 为可变 dict，内含 "count" 字段，由调用方维护。
+    """
+    any_success = False  # 是否有至少一次请求成功
+    
+    for nid in NORAD_IDS:
+        secs = ct.seconds_since_last_query(nid)
+        if secs < CELESTRAK_INTERVAL:
+            log.debug("[CelesTrak][%d] 距上次查询 %.0f 分钟，跳过本轮", nid, secs / 60)
+            continue  # 跳过不算成功也不算失败
+
+        record = ct.fetch_single(nid, use_supplemental=USE_SUPPLEMENTAL)
+        if record is None:
+            log.warning("[CelesTrak][%d] 查询失败", nid)
+            continue
+
+        any_success = True
+        orbit = parse_orbit(record)
+        cur_hash = orbit["tle_hash"]
+        record_source = record.get("_source", "celestrak")
+
+        prev = prev_data.get(nid)
+        if cur_hash != last_hash.get(nid):
+            change_type = classify_change(orbit, prev)
+            change_type_cn = format_change_type(change_type)
+            msg = (f"[{nid}] 检测到 TLE 变化！"
+                   f"(hash: {last_hash.get(nid, '无')} → {cur_hash}, "
+                   f"类型: {change_type_cn}, 来源: {record_source})")
+            log.info(msg)
+            write_log_message(msg)
+            print_orbit(orbit, prev)
+            log_record(orbit, change_type, source=record_source)
+            prev_data[nid] = orbit
+            last_hash[nid] = cur_hash
+        elif not ONLY_PRINT_ON_UPDATE:
+            print_orbit(orbit, None)
+        else:
+            log.info("[%d] %s：TLE 未变化（hash %s，来源: %s）",
+                     nid, orbit["name"], cur_hash, record_source)
+
+    return any_success
 
 # 主程序
 
 def main() -> None:
-    """主函数:启动 TLE 监控循环"""
-    # 检查凭据（优先检查,避免后续运行时才发现缺失）
-    if not USERNAME or not PASSWORD:
-        log.error("缺少 Space-Track 凭据!")
-        log.error("请在项目根目录创建 .env 文件并设置:")
-        log.error("  SPACETRACK_USER=your_email@example.com")
-        log.error("  SPACETRACK_PASS=your_password")
-        log.error("可参考 .env.example 模板文件")
+    """主函数：启动 TLE 监控循环（支持双源协同）"""
+
+    # 仅在 Space-Track 为主源或备源时才强制要求凭据
+    _st_required = (PRIMARY_SOURCE == "spacetrack" or FALLBACK_SOURCE == "spacetrack")
+    if _st_required and (not USERNAME or not PASSWORD):
+        log.error("当前配置需要 Space-Track 凭据（主源或备源为 spacetrack），但 .env 中未找到！")
+        log.error("请设置 SPACETRACK_USER / SPACETRACK_PASS，或将 data_source.primary 改为 celestrak")
         raise SystemExit(1)
 
-    log.info("Space-Track 轨道监控")
-    log.info("配置文件: config.yaml | 密钥: .env")
+    if PRIMARY_SOURCE == "celestrak" and not _CT_MODULE_OK:
+        log.error("data_source.primary=celestrak，但 celestrak_fetcher.py 未找到，请确认文件存在")
+        raise SystemExit(1)
+
+    log.info("TEL-Tracking 轨道监控  主源: %s  备源: %s", PRIMARY_SOURCE, FALLBACK_SOURCE)
     log.info("目标: %s", ", ".join(str(i) for i in NORAD_IDS))
 
     if XPROP_ACTIVE:
-        # 探活并打印版本信息
         alive = is_service_alive(XPROP_HOST, XPROP_PORT)
         if not alive:
-            log.warning(
-                "xpropagator 配置已启用但服务未响应（%s:%d），将自动降级到简单 5km 规则",
-                XPROP_HOST, XPROP_PORT,
-            )
+            log.warning("xpropagator 配置已启用但服务未响应（%s:%d），将自动降级", XPROP_HOST, XPROP_PORT)
     else:
         if XPROP_ENABLED and not _XPROP_MODULE_OK:
-            log.warning("xpropagator 已在 config.yaml 中启用，但 xpropagator_client.py 或 gRPC 存根未找到")
+            log.warning("xpropagator 已启用但模块未找到")
         elif not XPROP_ENABLED:
-            log.info("xpropagator 残差分析已禁用（config.yaml xpropagator.enabled=false），使用简单阈值")
+            log.info("xpropagator 已禁用，使用简单阈值")
 
     log.info(
-        "调度: 每小时第 %02d 分 | 再入预警: <%d km | 轨道数据: %s | 运行日志: %s | 缓存: %s",
-        SCHEDULED_MINUTE, REENTRY_WARNING_KM,
-        DATA_FILE or "关闭", LOG_FILE or "关闭", CACHE_FILE or "关闭",
+        "调度: 每小时第 %02d 分 | 再入预警: <%d km | 数据: %s | 日志: %s",
+        SCHEDULED_MINUTE, REENTRY_WARNING_KM, DATA_FILE or "关闭", LOG_FILE or "关闭",
     )
     print()
 
-    # 写入启动日志（确保日志文件被创建）
     write_log_message("程序启动")
 
-    # 加载缓存
+    # 加载 Space-Track 缓存（仅 spacetrack 模式使用，celestrak 模式中闲置）
     cache = LocalCache(CACHE_FILE)
 
-    # 从轨道数据文件恢复历史轨道状态（必须在断点恢复之前）
+    # 从 tle_data 恢复历史状态
     prev_data = restore_from_log(NORAD_IDS)
-
-    # 初始化哈希字典，用于检测 TLE 变化
     last_hash: dict[int, str] = {
         nid: orbit.get("tle_hash", "") for nid, orbit in prev_data.items()
     }
 
-    # 检查是否有待处理的数据（断点恢复）
-    if cache.has_pending_data:
+    # 冷启动：对无记录的卫星通过 CelesTrak 填充初始基准（与主源无关）
+    cold_start_if_needed(NORAD_IDS, prev_data)
+    # 冷启动后更新 last_hash
+    for nid, orbit in prev_data.items():
+        if nid not in last_hash:
+            last_hash[nid] = orbit.get("tle_hash", "")
+
+    # Space-Track 断点恢复（仅当缓存中有待处理数据时）
+    if PRIMARY_SOURCE == "spacetrack" and cache.has_pending_data:
         log.info("检测到未处理的全量数据，尝试断点恢复...")
-        
-        # 从缓存中获取全量原始数据
         all_records = cache.get_raw_records()
         if all_records:
-            # 筛选目标卫星
             raw_records = filter_by_norad(all_records, NORAD_IDS)
+            # 注入来源标识
+            for rec in raw_records.values():
+                rec.setdefault("_source", "spacetrack")
             found_ids = list(raw_records.keys())
             missing_ids = [nid for nid in NORAD_IDS if nid not in raw_records]
-            
             if found_ids:
-                log.info("断点恢复：筛选命中 %s", ', '.join(str(i) for i in found_ids))
+                log.info("断点恢复：命中 %s", ', '.join(str(i) for i in found_ids))
             if missing_ids:
-                log.info("断点恢复：本批次未包含 %s", ', '.join(str(i) for i in missing_ids))
-            
-            # 处理记录
+                log.info("断点恢复：未包含 %s", ', '.join(str(i) for i in missing_ids))
             process_records(raw_records, prev_data, last_hash, cache)
-            
-            # 清除待处理标记
             cache.clear_pending()
             log.info("断点恢复完成")
-        else:
-            log.warning("缓存中有待处理标记，但无实际数据")
 
     # 打印当前轨道状态
-    for norad_id in NORAD_IDS:
-        orbit = prev_data.get(norad_id)
+    for nid in NORAD_IDS:
+        orbit = prev_data.get(nid)
         if orbit:
             print_orbit(orbit, None)
 
     # 主循环
-    with SpaceTrackSession() as st:
-        first_run = True
-        while True:
-            # === 确定是否需要等待 ===
-            if first_run:
-                # 本轮首次迭代：检查距上次请求的时间
-                first_run = False
-                secs_since = cache.seconds_since_last_fetch()
-                if secs_since == float("inf"):
-                    # 从未请求过，立即执行首次查询
-                    log.info("无历史记录，将立即执行首次查询")
-                elif secs_since < MIN_REQUEST_INTERVAL:
-                    # 距上次请求不足 1 小时，需要等待以满足速率限制
-                    wait_seconds = MIN_REQUEST_INTERVAL - secs_since
+    consecutive_failures = {"count": 0}  # 主源连续失败计数
+    active_source = PRIMARY_SOURCE       # 当前实际使用的数据源
+
+    if PRIMARY_SOURCE == "spacetrack":
+        # Space-Track 主源路径（保持原有逻辑完整）
+        with SpaceTrackSession() as st:
+            first_run = True
+            while True:
+                if first_run:
+                    first_run = False
+                    secs_since = cache.seconds_since_last_fetch()
+                    if secs_since == float("inf"):
+                        log.info("无历史记录，将立即执行首次查询")
+                    elif secs_since < MIN_REQUEST_INTERVAL:
+                        wait_seconds = MIN_REQUEST_INTERVAL - secs_since
+                        log.warning("距上次请求 %.0f 分钟，需等待 %.0f 分钟", secs_since / 60, wait_seconds / 60)
+                        time.sleep(wait_seconds)
+                else:
+                    wake_at = compute_next_wake(cache, SCHEDULED_MINUTE)
+                    wait_until(wake_at)
+
+                log.info("[%s] 开始批量拉取（主源: spacetrack）...",
+                         datetime.now(timezone.utc).strftime("%H:%M:%S"))
+
+                # 主源请求
+                success = False
+                if active_source == "spacetrack":
+                    if not st.ensure_fresh_session():
+                        log.error("登录失败")
+                        consecutive_failures["count"] += 1
+                    else:
+                        all_records = fetch_bulk_with_relogin(st)
+                        if all_records is None:
+                            consecutive_failures["count"] += 1
+                        else:
+                            consecutive_failures["count"] = 0
+                            success = True
+                            cache.save_raw_records(all_records)
+                            raw_records = filter_by_norad(all_records, NORAD_IDS)
+                            # 注入来源标识
+                            for rec in raw_records.values():
+                                rec.setdefault("_source", "spacetrack")
+                            found_ids = list(raw_records.keys())
+                            missing_ids = [nid for nid in NORAD_IDS if nid not in raw_records]
+                            if found_ids:
+                                log.info("筛选命中：%s", ', '.join(str(i) for i in found_ids))
+                            if missing_ids:
+                                log.info("本批次未包含：%s", ', '.join(str(i) for i in missing_ids))
+                            process_records(raw_records, prev_data, last_hash, cache)
+                            cache.clear_pending()
+
+                elif active_source == "celestrak" and _CT_MODULE_OK:
+                    # 备源模式（Space-Track 故障期间）
+                    ok = run_celestrak_cycle(prev_data, last_hash, consecutive_failures)
+                    if ok:
+                        consecutive_failures["count"] = 0
+                        # 尝试恢复主源
+                        if st.ensure_fresh_session():
+                            log.info("主源 Space-Track 已恢复，切回主源")
+                            active_source = "spacetrack"
+                    else:
+                        consecutive_failures["count"] += 1
+
+                # 备源切换判断
+                if (consecutive_failures["count"] >= FALLBACK_THRESHOLD
+                        and active_source != FALLBACK_SOURCE
+                        and FALLBACK_SOURCE != "none"):
                     log.warning(
-                        "距上次请求 %.0f 分钟，需等待 %.0f 分钟以满足速率限制",
-                        secs_since / 60, wait_seconds / 60
+                        "主源 %s 连续失败 %d 次，切换到备源 %s",
+                        PRIMARY_SOURCE, consecutive_failures["count"], FALLBACK_SOURCE,
                     )
-                    time.sleep(wait_seconds)
-                # 如果 secs_since >= MIN_REQUEST_INTERVAL，无需等待，直接执行
+                    write_log_message(f"备源切换：{PRIMARY_SOURCE} → {FALLBACK_SOURCE}（连续失败 {consecutive_failures['count']} 次）")
+                    active_source = FALLBACK_SOURCE
+
+    else:
+        # CelesTrak 主源路径
+        log.info("以 CelesTrak 为主源启动，轮询间隔 %d 分钟", CELESTRAK_INTERVAL // 60)
+        while True:
+            log.info("[%s] 开始 CelesTrak 轮询...",
+                     datetime.now(timezone.utc).strftime("%H:%M:%S"))
+
+            ok = run_celestrak_cycle(prev_data, last_hash, consecutive_failures)
+            if ok:
+                consecutive_failures["count"] = 0
+                active_source = "celestrak"
             else:
-                # 非首次运行：计算下次唤醒时间并等待
-                # 同时考虑调度时刻和速率限制，取较晚的时刻
-                wake_at = compute_next_wake(cache, SCHEDULED_MINUTE)
-                wait_until(wake_at)
+                consecutive_failures["count"] += 1
+                log.warning("CelesTrak 本轮全部失败，连续失败 %d 次", consecutive_failures["count"])
 
-            # === 登录并拉取数据 ===
-            log.info("[%s] 开始批量拉取...", datetime.now(timezone.utc).strftime("%H:%M:%S"))
+                # 备源切换
+                if (consecutive_failures["count"] >= FALLBACK_THRESHOLD
+                        and FALLBACK_SOURCE == "spacetrack"
+                        and _st_required):
+                    if active_source != "spacetrack":
+                        log.warning("切换到备源 Space-Track")
+                        write_log_message(f"备源切换：celestrak → spacetrack（连续失败 {consecutive_failures['count']} 次）")
+                    active_source = "spacetrack"
+                    # Space-Track 备源：单次批量拉取
+                    with SpaceTrackSession() as st_tmp:
+                        if st_tmp.ensure_fresh_session():
+                            all_records = fetch_bulk_with_relogin(st_tmp)
+                            if all_records:
+                                consecutive_failures["count"] = 0
+                                active_source = "celestrak"  # 下轮尝试回主源
+                                cache.save_raw_records(all_records)
+                                raw_records = filter_by_norad(all_records, NORAD_IDS)
+                                # 注入来源标识
+                                for rec in raw_records.values():
+                                    rec.setdefault("_source", "spacetrack")
+                                process_records(raw_records, prev_data, last_hash, cache)
+                                cache.clear_pending()
+                            else:
+                                log.error("备源 Space-Track 登录失败或请求失败，请检查凭据是否过期")
+                        else:
+                            log.error("备源 Space-Track 登录失败，请检查凭据是否过期")
 
-            # 确保会话有效（超过 90 分钟会自动重新登录）
-            if not st.ensure_fresh_session():
-                log.error("登录失败，等待下一个调度周期")
-                continue
-
-            # 批量拉取最近 1 小时内发布的所有 TLE
-            all_records = fetch_bulk_with_relogin(st)
-            if all_records is None:
-                log.error("本次拉取失败，等待下一个调度周期")
-                continue
-
-            # === 保存全量数据到缓存 ===
-            # tle_cache.json 存储 Space-Track 返回的所有原始记录（覆盖旧数据）
-            cache.save_raw_records(all_records)
-
-            # === 筛选目标卫星 ===
-            # 从全量数据中筛选出 NORAD_IDS 中的卫星
-            raw_records = filter_by_norad(all_records, NORAD_IDS)
-            found_ids = list(raw_records.keys())
-            missing_ids = [nid for nid in NORAD_IDS if nid not in raw_records]
-
-            # 记录筛选结果
-            if found_ids:
-                log.info("筛选命中：%s", ', '.join(str(i) for i in found_ids))
-            if missing_ids:
-                log.info("本批次未包含（过去 1 小时内无新 TLE）：%s", ', '.join(str(i) for i in missing_ids))
-
-            # === 处理记录，Hash 比对，写入日志 ===
-            process_records(raw_records, prev_data, last_hash, cache)
-            
-            # 处理完成，清除待处理标记
-            cache.clear_pending()
+            # 等待下一个轮询周期
+            log.info("下次轮询：约 %d 分钟后", CELESTRAK_INTERVAL // 60)
+            time.sleep(CELESTRAK_INTERVAL)
 
 
 if __name__ == "__main__":

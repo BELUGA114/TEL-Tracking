@@ -34,8 +34,10 @@ CELESTRAK_SUP_GP_URL = "https://celestrak.org/NORAD/elements/supplemental/sup-gp
 # 频率下限，不允许外部修改
 CELESTRAK_MIN_INTERVAL: int = 7200  # 秒
 
-# User-Agent（善意使用标识）
-_USER_AGENT = "TEL-Tracking/1.0 (hobby satellite monitor; github.com/yourrepo)"
+# User-Agent（可选，用于标识应用身份）
+# 如果设置了环境变量 CELESTRAK_USER_AGENT，则使用该值；否则不设置 UA
+import os as _os
+_USER_AGENT: Optional[str] = _os.getenv("CELESTRAK_USER_AGENT") or None
 
 # 每颗卫星的上次请求时间戳 {norad_id: monotonic_time}
 _last_query: dict[int, float] = {}
@@ -68,11 +70,14 @@ def fetch_single(
 
     for attempt in range(1, 3):  # 最多重试一次
         try:
+            headers = {}
+            if _USER_AGENT:
+                headers["User-Agent"] = _USER_AGENT
             resp = requests.get(
                 url,
                 params=params,
                 timeout=timeout,
-                headers={"User-Agent": _USER_AGENT},
+                headers=headers if headers else None,
             )
         except requests.RequestException as e:
             log.warning("[CelesTrak][%d] 请求异常（第 %d 次）: %s", norad_id, attempt, e)
