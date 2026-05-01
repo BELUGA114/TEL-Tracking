@@ -608,6 +608,29 @@ def parse_orbit(record: dict) -> dict:
         "tle1": tle1,
         "tle2": tle2,
         "tle_hash": tle_hash,
+        # TODO (5位编号耗尽预案, ~2026-07-20):
+        # 届时 TLE_LINE1/TLE_LINE2 将不再提供。
+        # _raw_elements 保存原始根数，供 xpropagator_client.gp_json_to_tle_lines()
+        # 在 tle1/tle2 为空时重建 TLE 两行以维持残差分析能力。
+        "_raw_elements": {
+            "NORAD_CAT_ID": record.get("NORAD_CAT_ID"),
+            "OBJECT_ID": record.get("OBJECT_ID"),
+            "OBJECT_NAME": record.get("OBJECT_NAME"),
+            "EPOCH": record.get("EPOCH"),
+            "CLASSIFICATION_TYPE": record.get("CLASSIFICATION_TYPE"),
+            "ELEMENT_SET_NO": record.get("ELEMENT_SET_NO"),
+            "EPHEMERIS_TYPE": record.get("EPHEMERIS_TYPE"),
+            "INCLINATION": record.get("INCLINATION"),
+            "RA_OF_ASC_NODE": record.get("RA_OF_ASC_NODE"),
+            "ECCENTRICITY": record.get("ECCENTRICITY"),
+            "ARG_OF_PERICENTER": record.get("ARG_OF_PERICENTER"),
+            "MEAN_ANOMALY": record.get("MEAN_ANOMALY"),
+            "MEAN_MOTION": record.get("MEAN_MOTION"),
+            "MEAN_MOTION_DOT": record.get("MEAN_MOTION_DOT"),
+            "MEAN_MOTION_DDOT": record.get("MEAN_MOTION_DDOT"),
+            "BSTAR": record.get("BSTAR"),
+            "REV_AT_EPOCH": record.get("REV_AT_EPOCH"),
+        },
     }
 
 

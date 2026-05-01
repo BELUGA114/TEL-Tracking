@@ -112,11 +112,16 @@ def fetch_single(
 
         # 注入来源标识，供 log_record 使用
         record["_source"] = "celestrak_sup" if use_supplemental else "celestrak"
+        
         # TODO (5位编号耗尽预案): 保留原始根数，TLE 字段消失后作为 hash 输入
-        record["_orbital_elements"] = {
+        # 同时供 xpropagator_client.gp_json_to_tle_lines() 在 tle1/tle2 为空时重建 TLE
+        record["_raw_elements"] = {
             k: record.get(k)
-            for k in ("MEAN_MOTION", "ECCENTRICITY", "INCLINATION",
-                      "RA_OF_ASC_NODE", "ARG_OF_PERICENTER", "MEAN_ANOMALY", "EPOCH")
+            for k in ("NORAD_CAT_ID", "OBJECT_ID", "OBJECT_NAME", "EPOCH",
+                      "CLASSIFICATION_TYPE", "ELEMENT_SET_NO", "EPHEMERIS_TYPE",
+                      "INCLINATION", "RA_OF_ASC_NODE", "ECCENTRICITY",
+                      "ARG_OF_PERICENTER", "MEAN_ANOMALY", "MEAN_MOTION",
+                      "MEAN_MOTION_DOT", "MEAN_MOTION_DDOT", "BSTAR", "REV_AT_EPOCH")
         }
 
         _mark_queried(norad_id)
