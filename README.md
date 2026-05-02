@@ -18,11 +18,7 @@ A lightweight orbital monitoring script supporting dual data sources (Space-Trac
 ---
 
 ## Features
-
-- Supports both Space-Track and CelesTrak data sources with automatic failover
-- Strictly follows API rate limits (Space-Track: 1 gp query per hour; CelesTrak: once per 2 hours per satellite)
 - Intelligent scheduling system: considers both scheduled time and rate limits
-- Batch fetching + local filtering for Space-Track: avoids peak hours at :00 and :30
 - TLE change classification: distinguishes between solution corrections and real maneuvers
   - Default simple threshold rules based on perigee/apogee
   - Optional high-precision residual analysis (requires xpropagator service)
@@ -415,11 +411,7 @@ https://celestrak.org/NORAD/elements/gp.php?CATNR=25544&FORMAT=json
 ---
 
 ## 特性
-
-- 支持 Space-Track 和 CelesTrak 双数据源，自动故障转移
-- 严格遵循 API 速率限制（Space-Track：每小时 1 次 gp 查询；CelesTrak：每颗卫星每 2 小时一次）
 - 智能调度系统：同时考虑调度时刻和速率限制
-- Space-Track 模式：批量拉取 + 本地筛选，避开整点/半点高峰期
 - TLE 变化分类：区分解算修正（Correction）与真实机动（Maneuver）
   - 默认使用简单的近地点/远地点阈值规则
   - 可选启用高精度残差分析（依靠 xpropagator 服务）

@@ -286,9 +286,7 @@ def classify_change_xprop(
     verdict  = "maneuver" if delta_km >= maneuver_threshold_km else "correction"
 
     log.info(
-        "[%d→%d] xprop 残差 @ %s：Δr = %.3f km（阈值 %.1f km）→ %s",
-        prev_norad,
-        orbit_norad,
+        "xprop 残差 @ %s：Δr = %.3f km（阈值 %.1f km）→ %s",
         epoch_dt.strftime("%Y-%m-%dT%H:%MZ"),
         delta_km,
         maneuver_threshold_km,

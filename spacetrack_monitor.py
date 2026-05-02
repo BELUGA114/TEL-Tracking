@@ -557,6 +557,45 @@ def filter_by_norad(records: list[dict], norad_ids: list[int]) -> dict[int, dict
 
 
 # 轨道数据处理
+
+def _calculate_orbital_params(mean_motion: float, eccentricity: float) -> dict:
+    """
+    从平均运动和离心率计算轨道参数。
+    
+    Args:
+        mean_motion: 平均运动（圈/天）
+        eccentricity: 离心率
+    
+    Returns:
+        dict: 包含 periapsis (km), apoapsis (km), period (min)
+    """
+    if mean_motion <= 0:
+        return {"periapsis": 0.0, "apoapsis": 0.0, "period": 0.0}
+    
+    # 地球引力常数 (km^3/s^2)
+    mu = 398600.4418
+    # 地球半径 (km)
+    R_E = 6378.137
+    
+    # 周期（分钟）= 1440 / mean_motion
+    period_min = 1440.0 / mean_motion
+    
+    # 半长轴（km）：a = (mu / n^2)^(1/3)，其中 n 为角速度（rad/s）
+    # mean_motion 单位为 圈/天，需要转换为 rad/s
+    n_rad_s = mean_motion * 2.0 * math.pi / 86400.0
+    semi_major_axis = (mu / (n_rad_s ** 2)) ** (1.0 / 3.0)
+    
+    # 近地点和远地点（km）
+    periapsis = semi_major_axis * (1.0 - eccentricity) - R_E
+    apoapsis = semi_major_axis * (1.0 + eccentricity) - R_E
+    
+    return {
+        "periapsis": max(0.0, periapsis),  # 确保非负
+        "apoapsis": max(0.0, apoapsis),
+        "period": period_min,
+    }
+
+
 def classify_change(orbit: dict, prev: Optional[dict]) -> str:
     """
     判断 TLE 变化是真实机动还是解算修正。
@@ -608,6 +647,10 @@ def parse_orbit(record: dict) -> dict:
     2. 回退：当 TLE 为空时，使用 _raw_elements 序列化为 JSON 后计算 hash
        （5位编号耗尽后 ~2026-07-20 的主要方式）
     3. 如果两者均缺失，抛出 ValueError（数据不完整，无法继续处理）
+    
+    轨道参数计算策略：
+    - 如果 API 直接提供 PERIAPSIS/APOAPSIS/PERIOD，直接使用
+    - 否则从 MEAN_MOTION 和 ECCENTRICITY 计算（CelesTrak GP 接口场景）
     """
     name = (record.get("OBJECT_NAME") or "").strip()
     tle1 = str(record.get("TLE_LINE1") or "")
@@ -633,15 +676,46 @@ def parse_orbit(record: dict) -> dict:
                 f"也无 _raw_elements。无法计算 hash，请检查数据源返回格式。"
             )
     
+    # 提取或计算轨道参数
+    periapsis_raw = record.get("PERIAPSIS")
+    apoapsis_raw = record.get("APOAPSIS")
+    period_raw = record.get("PERIOD")
+    
+    # 如果 API 未提供这些字段（如 CelesTrak GP），则从轨道根数计算
+    if not periapsis_raw or not apoapsis_raw or not period_raw:
+        mean_motion = float(record.get("MEAN_MOTION") or 0)
+        eccentricity = float(record.get("ECCENTRICITY") or 0)
+        
+        if mean_motion > 0:
+            calculated = _calculate_orbital_params(mean_motion, eccentricity)
+            periapsis = calculated["periapsis"]
+            apoapsis = calculated["apoapsis"]
+            period = calculated["period"]
+            log.debug(
+                "[NORAD %d] API 未提供完整轨道参数，已从根数计算: "
+                "近地点=%.1f km, 远地点=%.1f km, 周期=%.3f min",
+                norad_id, periapsis, apoapsis, period,
+            )
+        else:
+            # 无法计算，使用默认值
+            periapsis = float(periapsis_raw or 0)
+            apoapsis = float(apoapsis_raw or 0)
+            period = float(period_raw or 0)
+    else:
+        # API 已提供，直接使用
+        periapsis = float(periapsis_raw)
+        apoapsis = float(apoapsis_raw)
+        period = float(period_raw)
+    
     return {
         "norad": norad_id,
         "name": name or "TBA",
         "intl_id": record.get("OBJECT_ID", ""),
         "epoch": record.get("EPOCH", ""),
-        "periapsis": float(record.get("PERIAPSIS") or 0),
-        "apoapsis": float(record.get("APOAPSIS") or 0),
+        "periapsis": periapsis,
+        "apoapsis": apoapsis,
         "incl": float(record.get("INCLINATION") or 0),
-        "period": float(record.get("PERIOD") or 0),
+        "period": period,
         "ecc": float(record.get("ECCENTRICITY") or 0),
         "bstar": float(record.get("BSTAR") or 0),
         "tle1": tle1,
@@ -855,8 +929,8 @@ def process_records(
         # 获取该卫星的最新记录（已包含 _batch_count）
         record = raw_records.get(norad_id)
         if not record:
-            # 本批次中没有该卫星的新 TLE
-            log.info("[%d] 本批次无数据（过去 1 小时内未发布新 TLE）", norad_id)
+            # 本批次中没有该卫星的新 TLE（仅写入文件）
+            write_log_message(f"[{norad_id}] 本批次无数据（过去 1 小时内未发布新 TLE）")
             continue
         
         # 提取来源标识（确认 record 不为 None 后读取）
@@ -875,9 +949,9 @@ def process_records(
         prev = prev_data.get(norad_id)
         cur_hash = orbit["tle_hash"]
 
-        # 如果本批次有多条记录，记录日志
+        # 如果本批次有多条记录，记录日志（仅写入文件）
         if batch_count > 1:
-            log.info("[%d] 本批次共 %d 条解算记录，取最新一条", norad_id, batch_count)
+            write_log_message(f"[{norad_id}] 本批次共 {batch_count} 条解算记录，取最新一条")
 
         # 检测 TLE 是否变化（与最新 Hash 比较）
         if cur_hash != last_hash.get(norad_id):
@@ -902,8 +976,8 @@ def process_records(
             # Hash 相同，但配置为打印所有数据
             print_orbit(orbit, None)  # TLE 未变化，不显示 delta
         else:
-            # Hash 相同，且配置为仅打印变化，只记录日志
-            log.info("[%d] %s：TLE 未变化（hash %s）", norad_id, orbit['name'], cur_hash)
+            # Hash 相同，且配置为仅打印变化，只写入文件
+            write_log_message(f"[{norad_id}] {orbit['name']}：TLE 未变化（hash {cur_hash}）")
 
     # 更新缓存时间戳（全量数据已在 save_raw_records 中保存）
     # 即使没有命中目标，也要更新时间戳，避免下次启动时重复请求
@@ -997,8 +1071,8 @@ def run_celestrak_cycle(
         elif not ONLY_PRINT_ON_UPDATE:
             print_orbit(orbit, None)
         else:
-            log.info("[%d] %s：TLE 未变化（hash %s，来源: %s）",
-                     nid, orbit["name"], cur_hash, record_source)
+            # Hash 相同，且配置为仅打印变化，只写入文件
+            write_log_message(f"[{nid}] {orbit['name']}：TLE 未变化（hash {cur_hash}，来源: {record_source})")
 
     return any_success
 
@@ -1057,7 +1131,7 @@ def main() -> None:
 
     # Space-Track 断点恢复（仅当缓存中有待处理数据时）
     if PRIMARY_SOURCE == "spacetrack" and cache.has_pending_data:
-        log.info("检测到未处理的全量数据，尝试断点恢复...")
+        write_log_message("检测到未处理的全量数据，尝试断点恢复...")
         all_records = cache.get_raw_records()
         if all_records:
             raw_records = filter_by_norad(all_records, NORAD_IDS)
@@ -1067,12 +1141,12 @@ def main() -> None:
             found_ids = list(raw_records.keys())
             missing_ids = [nid for nid in NORAD_IDS if nid not in raw_records]
             if found_ids:
-                log.info("断点恢复：命中 %s", ', '.join(str(i) for i in found_ids))
+                write_log_message(f"断点恢复：命中 {', '.join(str(i) for i in found_ids)}")
             if missing_ids:
-                log.info("断点恢复：未包含 %s", ', '.join(str(i) for i in missing_ids))
+                write_log_message(f"断点恢复：未包含 {', '.join(str(i) for i in missing_ids)}")
             process_records(raw_records, prev_data, last_hash, cache)
             cache.clear_pending()
-            log.info("断点恢复完成")
+            write_log_message("断点恢复完成")
 
     # 打印当前轨道状态
     for nid in NORAD_IDS:
@@ -1096,14 +1170,20 @@ def main() -> None:
                         log.info("无历史记录，将立即执行首次查询")
                     elif secs_since < MIN_REQUEST_INTERVAL:
                         wait_seconds = MIN_REQUEST_INTERVAL - secs_since
-                        log.warning("距上次请求 %.0f 分钟，需等待 %.0f 分钟", secs_since / 60, wait_seconds / 60)
+                        log.warning(
+                            "距上次请求 %.0f 分钟，需等待 %.0f 分钟（速率限制保护）",
+                            secs_since / 60,
+                            wait_seconds / 60,
+                        )
                         time.sleep(wait_seconds)
                 else:
                     wake_at = compute_next_wake(cache, SCHEDULED_MINUTE)
                     wait_until(wake_at)
 
-                log.info("[%s] 开始批量拉取（主源: spacetrack）...",
-                         datetime.now(timezone.utc).strftime("%H:%M:%S"))
+                # 开始批量拉取（仅写入文件）
+                write_log_message(
+                    f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] 开始批量拉取（主源: spacetrack）"
+                )
 
                 # 主源请求
                 success = False
@@ -1126,9 +1206,9 @@ def main() -> None:
                             found_ids = list(raw_records.keys())
                             missing_ids = [nid for nid in NORAD_IDS if nid not in raw_records]
                             if found_ids:
-                                log.info("筛选命中：%s", ', '.join(str(i) for i in found_ids))
+                                write_log_message(f"筛选命中：{', '.join(str(i) for i in found_ids)}")
                             if missing_ids:
-                                log.info("本批次未包含：%s", ', '.join(str(i) for i in missing_ids))
+                                write_log_message(f"本批次未包含：{', '.join(str(i) for i in missing_ids)}")
                             process_records(raw_records, prev_data, last_hash, cache)
                             cache.clear_pending()
 
@@ -1139,7 +1219,7 @@ def main() -> None:
                         consecutive_failures["count"] = 0
                         # 尝试恢复主源
                         if st.ensure_fresh_session():
-                            log.info("主源 Space-Track 已恢复，切回主源")
+                            write_log_message("主源 Space-Track 已恢复，切回主源")
                             active_source = "spacetrack"
                     else:
                         consecutive_failures["count"] += 1
@@ -1156,11 +1236,46 @@ def main() -> None:
                     active_source = FALLBACK_SOURCE
 
     else:
-        # CelesTrak 主源路径
-        log.info("以 CelesTrak 为主源启动，轮询间隔 %d 分钟", CELESTRAK_INTERVAL // 60)
+        # CelesTrak 主源路径（仅需速率限制，无需调度时刻）
+        write_log_message(f"以 CelesTrak 为主源启动，轮询间隔 {CELESTRAK_INTERVAL // 60} 分钟")
+        
+        # 加载 CelesTrak 轮询时间戳缓存（用于速率保护）
+        celestrak_cache_path = "celestrak_poll_cache.json"
+        celestrak_last_poll: Optional[float] = None
+        try:
+            if os.path.exists(celestrak_cache_path):
+                with open(celestrak_cache_path, "r", encoding="utf-8") as f:
+                    cache_data = json.load(f)
+                    celestrak_last_poll = cache_data.get("last_poll_ts")
+                    log.debug("已加载 CelesTrak 轮询缓存，上次轮询时间戳: %s", celestrak_last_poll)
+        except (OSError, json.JSONDecodeError) as e:
+            log.warning("CelesTrak 轮询缓存加载失败: %s", e)
+        
         while True:
-            log.info("[%s] 开始 CelesTrak 轮询...",
-                     datetime.now(timezone.utc).strftime("%H:%M:%S"))
+            # 检查距上次轮询的时间间隔，确保满足最小速率限制
+            if celestrak_last_poll is not None:
+                secs_since = time.monotonic() - celestrak_last_poll
+                if secs_since < CELESTRAK_INTERVAL:
+                    wait_seconds = CELESTRAK_INTERVAL - secs_since
+                    log.warning(
+                        "距上次 CelesTrak 轮询 %.0f 分钟，需等待 %.0f 分钟（速率限制保护）",
+                        secs_since / 60,
+                        wait_seconds / 60,
+                    )
+                    write_log_message(
+                        f"距上次 CelesTrak 轮询 {secs_since / 60:.0f} 分钟，需等待 {wait_seconds / 60:.0f} 分钟"
+                    )
+                    time.sleep(wait_seconds)
+                else:
+                    write_log_message(f"距上次 CelesTrak 轮询 {secs_since / 60:.0f} 分钟，满足速率限制")
+            else:
+                log.info("无 CelesTrak 轮询历史记录，将立即执行首次查询")
+                write_log_message("无 CelesTrak 轮询历史记录，将立即执行首次查询")
+            
+            # 开始 CelesTrak 轮询（仅写入文件）
+            write_log_message(
+                f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] 开始 CelesTrak 轮询"
+            )
 
             ok = run_celestrak_cycle(prev_data, last_hash, consecutive_failures)
             if ok:
@@ -1168,14 +1283,14 @@ def main() -> None:
                 active_source = "celestrak"
             else:
                 consecutive_failures["count"] += 1
-                log.warning("CelesTrak 本轮全部失败，连续失败 %d 次", consecutive_failures["count"])
+                write_log_message(f"CelesTrak 本轮全部失败，连续失败 {consecutive_failures['count']} 次")
 
                 # 备源切换
                 if (consecutive_failures["count"] >= FALLBACK_THRESHOLD
                         and FALLBACK_SOURCE == "spacetrack"
                         and _st_required):
                     if active_source != "spacetrack":
-                        log.warning("切换到备源 Space-Track")
+                        write_log_message("切换到备源 Space-Track")
                         write_log_message(f"备源切换：celestrak → spacetrack（连续失败 {consecutive_failures['count']} 次）")
                     active_source = "spacetrack"
                     # Space-Track 备源：单次批量拉取
@@ -1196,10 +1311,14 @@ def main() -> None:
                                 log.error("备源 Space-Track 登录失败或请求失败，请检查凭据是否过期")
                         else:
                             log.error("备源 Space-Track 登录失败，请检查凭据是否过期")
-
-            # 等待下一个轮询周期
-            log.info("下次轮询：约 %d 分钟后", CELESTRAK_INTERVAL // 60)
-            time.sleep(CELESTRAK_INTERVAL)
+            
+            # 更新轮询时间戳（每次轮询完成后记录）
+            celestrak_last_poll = time.monotonic()
+            try:
+                with open(celestrak_cache_path, "w", encoding="utf-8") as f:
+                    json.dump({"last_poll_ts": celestrak_last_poll}, f)
+            except OSError as e:
+                log.warning("CelesTrak 轮询时间戳保存失败: %s", e)
 
 
 if __name__ == "__main__":
