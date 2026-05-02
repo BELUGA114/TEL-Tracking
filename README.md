@@ -1,31 +1,33 @@
-# Space-Track TLE Monitor
+# TEL-Tracking
 
 <a id="language-selector"></a>
-**Language / 语言**: [🇺🇸 English](#english-version) | [🇨🇳 中文](#chinese-version)
+**Language / 语言**: [English](#english-version) | [中文](#chinese-version)
 
 ---
 
 <a id="english-version"></a>
 
-A lightweight orbital monitoring script for Space-Track.org that provides:
+A lightweight orbital monitoring script supporting dual data sources (Space-Track.org and CelesTrak) that provides:
 
 - Monitoring of single or multiple satellites' TLE updates
 - Automatic detection of orbital changes and distinction between solution corrections and real maneuvers (based on hash comparison)
 - Output of orbital parameter changes (perigee/apogee, etc.)
 - Simplified reentry time estimation (for reference only)
+- Dual-source failover mechanism for improved reliability
 
 ---
 
 ## Features
 
-- Strictly follows Space-Track API rate limits (1 gp query per hour)
+- Supports both Space-Track and CelesTrak data sources with automatic failover
+- Strictly follows API rate limits (Space-Track: 1 gp query per hour; CelesTrak: once per 2 hours per satellite)
 - Intelligent scheduling system: considers both scheduled time and rate limits
-- Batch fetching + local filtering: avoids peak hours at :00 and :30
+- Batch fetching + local filtering for Space-Track: avoids peak hours at :00 and :30
 - TLE change classification: distinguishes between solution corrections and real maneuvers
   - Default simple threshold rules based on perigee/apogee
   - Optional high-precision residual analysis (requires xpropagator service)
 - Breakpoint recovery mechanism: automatically recovers unprocessed data from cache after program crash
-
+- Cold start support: new users can start monitoring without Space-Track account via CelesTrak
 - Automatic state recovery on restart: restores last orbital state from historical data
 
 
@@ -43,7 +45,7 @@ pip install requests python-dotenv
 
 ---
 
-### 2. Configure Space-Track Account
+### 2. Configure Credentials
 
 **Step 1: Copy template file**
 
@@ -53,7 +55,7 @@ Copy `.env.example` and rename it to `.env`:
 cp .env.example .env
 ```
 
-**Step 2: Fill in credentials**
+**Step 2: Fill in credentials (required for Space-Track mode)**
 
 Open the `.env` file with a text editor and enter your Space-Track account credentials:
 
@@ -62,17 +64,17 @@ SPACETRACK_USER=your_email@example.com
 SPACETRACK_PASS=your_password
 ```
 
-
 > - The `.env` file contains your account credentials, do not share it with others
 > - If you don't have a Space-Track account, register at [space-track.org](https://www.space-track.org) first
+> - **Note**: If using CelesTrak as primary source (see section 4), Space-Track credentials are optional
 
 ---
 
-### 3. Configure Monitoring Targets
+### 3. Configure Monitoring Targets and Data Source
 
-If you want to modify the monitored satellites or adjust other parameters, edit the `config.yaml` file
+Edit the `config.yaml` file to modify monitored satellites and adjust parameters.
 
-**Simplest usage**: If you only want to monitor ISS, use the default configuration without modification
+**Simplest usage**: Monitor ISS using default configuration (CelesTrak as primary source, no authentication required)
 
 **Custom configuration example**:
 
@@ -81,17 +83,27 @@ targets:
   norad_ids: [25544, 48273]  # Monitor multiple satellites, separated by commas
 
 schedule:
-  minute: 17  # Request data at the 17th minute of each hour (avoid peak hours at :00 and :30)
+  minute: 17  # Request data at the 17th minute of each hour (Space-Track mode only)
 
 alerts:
   reentry_warning_km: 200                          # Warning when perigee is below 200km
   only_print_on_update: true                       # Only print when TLE changes to avoid spam
   fallback_maneuver_threshold_km: 5.0              # Fallback strategy maneuver detection threshold (km)
+
+# Dual-source configuration
+data_source:
+  primary: "celestrak"         # Primary source: "celestrak" | "spacetrack"
+  fallback: "spacetrack"       # Fallback source: "spacetrack" | "celestrak" | "none"
+  fallback_threshold: 3        # Switch to fallback after this many consecutive failures
+  celestrak_interval_seconds: 7200   # CelesTrak polling interval (seconds), minimum 7200
+  use_supplemental: false      # Query SupGP interface for additional ephemeris (e.g., Starlink)
 ```
 
 **Common configuration explanations**:
-- `norad_ids`: List of satellite NORAD IDs to monitor, can be queried at [space-track.org](https://www.space-track.org)
-- `minute`: Minute of each hour to request data, recommended values are 12, 17, 42, 48, etc., avoiding 0 and 30
+- `norad_ids`: List of satellite NORAD IDs to monitor, can be queried at [space-track.org](https://www.space-track.org) or [celestrak.org](https://celestrak.org)
+- `primary`: Primary data source. "celestrak" requires no authentication; "spacetrack" requires valid credentials
+- `fallback`: Backup data source when primary fails continuously
+- `celestrak_interval_seconds`: Minimum interval between CelesTrak queries per satellite (default 7200 seconds = 2 hours)
 - `only_print_on_update`: Set to `true` to reduce console output, only display when there are updates
 
 > **Tip**: Restart the script after modifying `config.yaml` for changes to take effect
@@ -141,18 +153,17 @@ python spacetrack_monitor.py
 ```
 
 On first run, the script will:
-1. Load your account configuration
-2. Log in to Space-Track
+1. Load your configuration
+2. Perform cold start if needed (fetch initial data from CelesTrak for new satellites)
 3. Execute the first data fetch immediately
-4. Automatically check once every hour thereafter
+4. Automatically check according to configured schedule thereafter
 
 Successful execution shows output similar to:
 
 ```
-2026-04-27 21:31:54 Space-Track Orbital Monitor
-2026-04-27 21:31:54 Config file: config.yaml | Credentials: .env
-2026-04-27 21:31:54 Target: 25544
-2026-04-27 21:31:54 Schedule: Every hour at minute 17 | Reentry warning: <200 km
+2026-05-02 10:00:00 TEL-Tracking Orbital Monitor  Primary: celestrak  Fallback: spacetrack
+2026-05-02 10:00:00 Target: 25544
+2026-05-02 10:00:00 Schedule: Every 2 hours (CelesTrak) | Reentry warning: <200 km
 ```
 
 ---
@@ -168,11 +179,11 @@ targets:
   norad_ids: [25544]          # Monitoring targets (NORAD ID list)
 
 schedule:
-  minute: 12                  # Minute of each hour to request data (recommended 12 or 48)
+  minute: 12                  # Minute of each hour to request data (Space-Track mode only, recommended 12 or 48)
 
 files:
   data_file: tle_data.jsonl   # Orbital data file
-  cache: tle_cache.json       # Temporary cache file
+  cache: tle_cache.json       # Temporary cache file (Space-Track mode only)
   run_log: tle_log.jsonl      # Runtime log file
   max_log_size_mb: 10         # Log rotation threshold (MB)
 
@@ -186,6 +197,19 @@ retry:
   login_pause_seconds: 1800   # Wait time after login failure (seconds)
   request_max_retries: 3      # Maximum request retry attempts
   request_retry_base: 5       # Exponential backoff base (seconds)
+
+xpropagator:
+  enabled: true              # Enable residual analysis
+  host: localhost            # xpropagator service address
+  port: 50051                # gRPC port
+  maneuver_threshold_km: 5.0 # Maneuver detection threshold (km)
+
+data_source:
+  primary: "celestrak"         # Primary source: "celestrak" | "spacetrack"
+  fallback: "spacetrack"       # Fallback source: "spacetrack" | "celestrak" | "none"
+  fallback_threshold: 3        # Switch after consecutive failures
+  celestrak_interval_seconds: 7200   # CelesTrak polling interval (seconds)
+  use_supplemental: false      # Query SupGP interface
 ```
 
 ### Data Files
@@ -329,15 +353,16 @@ Can be used for: orbital trend analysis, maneuver event detection (directly filt
 
 ## Important Notes
 
-This project strictly complies with Space-Track.org API usage specifications.
+This project strictly complies with Space-Track.org and CelesTrak.org API usage specifications.
 
 ### Rate Limits
 
-Only 1 request per hour is allowed to gp endpoints, violations will result in account suspension.
+- **Space-Track**: Only 1 request per hour is allowed to gp endpoints, violations will result in account suspension
+- **CelesTrak**: Query each satellite at most once per 2 hours, excessive requests may trigger temporary blocking
 
 ### Recommended Query Method
 
-Should not frequently query individual NORAD IDs, instead use batch queries to get all TLEs published in the past hour, then filter target satellites locally.
+**Space-Track**: Should not frequently query individual NORAD IDs, instead use batch queries to get all TLEs published in the past hour, then filter target satellites locally.
 
 ```
 https://www.space-track.org/basicspacedata/query/class/gp/decay_date/null-val/CREATION_DATE/%3Enow-0.042/format/json
@@ -348,10 +373,17 @@ This query returns:
 - TLEs published in the past 1 hour (CREATION_DATE/%3Enow-0.042, 0.042 days ≈ 1 hour)
 - JSON format output (convenient for local processing)
 
+**CelesTrak**: Query by NORAD ID, parameters CATNR=<ID>, FORMAT=json. Example:
+
+```
+https://celestrak.org/NORAD/elements/gp.php?CATNR=25544&FORMAT=json
+```
+
 ### Scheduling Time Requirements
 
-- Avoid peak hours at :00 and :30 (such as 09:00, 09:30), recommend using off-peak times (such as 09:12, 09:48)
-- This script defaults to executing at the 17th minute of each hour 
+- **Space-Track**: Avoid peak hours at :00 and :30 (such as 09:00, 09:30), recommend using off-peak times (such as 09:12, 09:48)
+- **CelesTrak**: Poll every 2 hours, script automatically controls frequency
+- This script defaults to CelesTrak as primary source, checking every 2 hours
 
 ### Do Not Modify Scheduling Logic to Circumvent Rate Limits
 
@@ -360,36 +392,39 @@ This query returns:
 ## Related Links
 
 - [Space-Track.org](https://www.space-track.org/)
-- [API Documentation](https://www.space-track.org/documentation#/api)
+- [CelesTrak.org](https://celestrak.org/)
+- [Space-Track API Documentation](https://www.space-track.org/documentation#/api)
 - [xpropagator](https://github.com/xpropagation/xpropagator)
 
 ---
 
 <a id="chinese-version"></a>
 
-# Space-Track TLE Monitor (中文版)
+# TEL-Tracking (中文版)
 
 > **注意**: 这是中文版本。如需英文版本，请查看上方的 [English Version](#english-version)。
 
-一个面向 Space-Track.org 的轻量级轨道监控脚本，用于：
+一个支持双数据源（Space-Track.org 和 CelesTrak）的轻量级轨道监控脚本，用于：
 
 - 监控单颗或多颗卫星的 TLE 更新
 - 自动检测轨道变化并分辨解算修正与真实机动（基于哈希比对）
 - 输出轨道参数变化（近地点 / 远地点等）
 - 附带简化的再入时间估算（仅供参考）
+- 双源故障转移机制，提高可靠性
 
 ---
 
 ## 特性
 
-- 严格遵循 Space-Track API 速率限制（每小时 1 次 gp 查询）
+- 支持 Space-Track 和 CelesTrak 双数据源，自动故障转移
+- 严格遵循 API 速率限制（Space-Track：每小时 1 次 gp 查询；CelesTrak：每颗卫星每 2 小时一次）
 - 智能调度系统：同时考虑调度时刻和速率限制
-- 批量拉取 + 本地筛选：避开整点/半点高峰期
+- Space-Track 模式：批量拉取 + 本地筛选，避开整点/半点高峰期
 - TLE 变化分类：区分解算修正（Correction）与真实机动（Maneuver）
   - 默认使用简单的近地点/远地点阈值规则
   - 可选启用高精度残差分析（依靠 xpropagator 服务）
 - 断点恢复机制：程序崩溃后自动从缓存恢复未处理数据
-
+- 冷启动支持：新用户无需 Space-Track 账号即可通过 CelesTrak 开始监控
 - 重启自动恢复状态：从历史数据恢复上次轨道状态
 
 
@@ -407,7 +442,7 @@ pip install requests python-dotenv
 
 ---
 
-### 2. 配置 Space-Track 账号
+### 2. 配置凭据
 
 **步骤 1：复制模板文件**
 
@@ -417,7 +452,7 @@ pip install requests python-dotenv
 cp .env.example .env
 ```
 
-**步骤 2：填写账号密码**
+**步骤 2：填写凭据（Space-Track 模式必需）**
 
 用文本编辑器打开 `.env` 文件，填入你的 Space-Track 账号和密码：
 
@@ -426,17 +461,17 @@ SPACETRACK_USER=your_email@example.com
 SPACETRACK_PASS=your_password
 ```
 
-
 > - `.env` 文件包含你的账号密码，不要分享给他人
 > - 如果没有 Space-Track 账号，需要先去 [space-track.org](https://www.space-track.org) 注册
+> - **注意**：如果使用 CelesTrak 作为主数据源（见第 4 节），Space-Track 凭据为可选
 
 ---
 
-### 3. 配置监控目标
+### 3. 配置监控目标与数据源
 
-如果你想修改监控的卫星或调整其他参数，可以编辑 `config.yaml` 文件
+编辑 `config.yaml` 文件以修改监控的卫星或调整其他参数。
 
-**最简单的用法**：如果你只想监控 ISS，可以直接使用默认配置，无需修改
+**最简单的用法**：使用默认配置监控 ISS（CelesTrak 作为主数据源，无需认证）
 
 **自定义配置示例**：
 
@@ -445,17 +480,27 @@ targets:
   norad_ids: [25544, 48273]  # 监控多个卫星，用逗号分隔
 
 schedule:
-  minute: 17  # 每小时第 17 分钟请求数据（避开整点/半点高峰）
+  minute: 17  # 每小时第 17 分钟请求数据（仅 Space-Track 模式）
 
 alerts:
   reentry_warning_km: 200                          # 近地点低于 200km 时发出预警
   only_print_on_update: true                       # 只在 TLE 变化时打印，避免刷屏
   fallback_maneuver_threshold_km: 5.0              # 降级策略机动判定阈值（km）
+
+# 双源配置
+data_source:
+  primary: "celestrak"         # 主数据源: "celestrak" | "spacetrack"
+  fallback: "spacetrack"       # 备源: "spacetrack" | "celestrak" | "none"
+  fallback_threshold: 3        # 主源连续失败几次后切换备源
+  celestrak_interval_seconds: 7200   # CelesTrak 轮询间隔（秒），最小 7200
+  use_supplemental: false      # 是否查询 SupGP 接口（Starlink 等补充星历）
 ```
 
 **常用配置说明**：
-- `norad_ids`: 要监控的卫星编号列表，可以在 [space-track.org](https://www.space-track.org) 查询
-- `minute`: 每小时请求数据的分钟数，建议设置为 12、17、42、48 等，避开 0 和 30
+- `norad_ids`: 要监控的卫星编号列表，可以在 [space-track.org](https://www.space-track.org) 或 [celestrak.org](https://celestrak.org) 查询
+- `primary`: 主数据源。"celestrak" 无需认证；"spacetrack" 需要有效凭据
+- `fallback`: 主源连续失败时的备用数据源
+- `celestrak_interval_seconds`: 每颗卫星的 CelesTrak 查询最小间隔（默认 7200 秒 = 2 小时）
 - `only_print_on_update`: 设为 `true` 可以减少控制台输出，只在有更新时才显示
 
 > **提示**：修改 `config.yaml` 后需要重启脚本才能生效
@@ -505,18 +550,17 @@ python spacetrack_monitor.py
 ```
 
 首次运行时，脚本会：
-1. 加载你的账号配置
-2. 登录 Space-Track
+1. 加载你的配置
+2. 如需冷启动（为新卫星从 CelesTrak 获取初始数据）
 3. 立即执行第一次数据拉取
-4. 之后每小时自动检查一次
+4. 之后按配置的调度自动检查
 
 看到类似以下输出表示运行成功：
 
 ```
-2026-04-27 21:31:54 Space-Track 轨道监控
-2026-04-27 21:31:54 配置文件: config.yaml | 密钥: .env
-2026-04-27 21:31:54 目标: 25544
-2026-04-27 21:31:54 调度: 每小时第 17 分 | 再入预警: <200 km
+2026-05-02 10:00:00 TEL-Tracking 轨道监控  主源: celestrak  备源: spacetrack
+2026-05-02 10:00:00 目标: 25544
+2026-05-02 10:00:00 调度: 每 2 小时 (CelesTrak) | 再入预警: <200 km
 ```
 
 ---
@@ -532,11 +576,11 @@ targets:
   norad_ids: [25544]          # 监控目标（NORAD 编号列表）
 
 schedule:
-  minute: 12                  # 每小时请求的分钟数（建议 12 或 48）
+  minute: 12                  # 每小时请求的分钟数（仅 Space-Track 模式，建议 12 或 48）
 
 files:
   data_file: tle_data.jsonl   # 轨道数据文件
-  cache: tle_cache.json       # 临时缓存文件
+  cache: tle_cache.json       # 临时缓存文件（仅 Space-Track 模式）
   run_log: tle_log.jsonl      # 运行日志文件
   max_log_size_mb: 10         # 日志轮转阈值（MB）
 
@@ -550,6 +594,19 @@ retry:
   login_pause_seconds: 1800   # 登录失败后等待时间（秒）
   request_max_retries: 3      # 请求最大重试次数
   request_retry_base: 5       # 指数退避基数（秒）
+
+xpropagator:
+  enabled: true              # 启用残差分析
+  host: localhost            # xpropagator 服务地址
+  port: 50051                # gRPC 端口
+  maneuver_threshold_km: 5.0 # 机动判定阈值（km）
+
+data_source:
+  primary: "celestrak"         # 主数据源: "celestrak" | "spacetrack"
+  fallback: "spacetrack"       # 备源: "spacetrack" | "celestrak" | "none"
+  fallback_threshold: 3        # 连续失败后切换
+  celestrak_interval_seconds: 7200   # CelesTrak 轮询间隔（秒）
+  use_supplemental: false      # 查询 SupGP 接口
 ```
 
 ### 数据文件
@@ -693,15 +750,16 @@ TEL-Tracking 仅通过网络 gRPC 调用外部 xpropagator 服务，项目本身
 
 ## 注意事项
 
-本项目严格遵守 Space-Track.org 的 API 使用规范。
+本项目严格遵守 Space-Track.org 和 CelesTrak.org 的 API 使用规范。
 
 ### 速率限制
 
-每小时仅允许向 gp 类端点发起 1 次请求，违规会导致账号被封。
+- **Space-Track**：每小时仅允许向 gp 类端点发起 1 次请求，违规会导致账号被封
+- **CelesTrak**：每颗卫星每 2 小时至多查询一次，过度请求可能触发临时封锁
 
 ### 推荐的查询方式
 
-不应针对单个 NORAD ID 频繁查询，而应使用批量查询获取过去一小时内发布的所有 TLE，然后在本地筛选目标卫星。
+**Space-Track**：不应针对单个 NORAD ID 频繁查询，而应使用批量查询获取过去一小时内发布的所有 TLE，然后在本地筛选目标卫星。
 
 ```
 https://www.space-track.org/basicspacedata/query/class/gp/decay_date/null-val/CREATION_DATE/%3Enow-0.042/format/json
@@ -712,10 +770,17 @@ https://www.space-track.org/basicspacedata/query/class/gp/decay_date/null-val/CR
 - 在过去 1 小时内发布的 TLE（CREATION_DATE/%3Enow-0.042，0.042天约等于1小时）
 - JSON 格式输出（便于本地处理）
 
+**CelesTrak**：按 NORAD ID 单星查询，参数 CATNR=<编号>，FORMAT=json。例如：
+
+```
+https://celestrak.org/NORAD/elements/gp.php?CATNR=25544&FORMAT=json
+```
+
 ### 调度时间要求
 
-- 避开整点和半点高峰期（如 09:00、09:30），建议使用非高峰时段（如 09:12、09:48）
-- 本脚本默认设置为每小时第 17 分钟执行 
+- **Space-Track**：避开整点和半点高峰期（如 09:00、09:30），建议使用非高峰时段（如 09:12、09:48）
+- **CelesTrak**：每 2 小时轮询一次，脚本自动控制频率
+- 本脚本默认设置为 CelesTrak 主源，每 2 小时检查一次
 
 ### 请勿修改调度逻辑以规避速率限制
 
@@ -724,7 +789,8 @@ https://www.space-track.org/basicspacedata/query/class/gp/decay_date/null-val/CR
 ## 相关链接
 
 - [Space-Track.org](https://www.space-track.org/)
-- [API 文档](https://www.space-track.org/documentation#/api)
+- [CelesTrak.org](https://celestrak.org/)
+- [Space-Track API Documentation](https://www.space-track.org/documentation#/api)
 - [xpropagator](https://github.com/xpropagation/xpropagator)
 
 ---

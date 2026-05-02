@@ -1,11 +1,8 @@
-# Space-Track TLE 监控配置
+# TEL-Tracking 轨道监控配置
 # 密钥（账号密码）请在 .env 文件中填写，不要写在这里
 
 # User-Agent 配置（可选）
-# Space-Track 和 CelesTrak 不强制要求 User-Agent，但建议填写以标识应用身份
-# 格式建议："项目名称/版本 (联系方式)"
-# 例如："MySatTracker/1.0 (user@example.com)"
-# 留空则不发送 User-Agent 头部
+# Space-Track 和 CelesTrak 统一使用此 UA，留空则不发送
 user_agent: ""
 
 targets:

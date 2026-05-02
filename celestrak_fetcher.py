@@ -2,7 +2,7 @@
 CelesTrak 单星查询封装 + 每星频率控制
 
 接口说明：
-  fetch_single(norad_id, use_supplemental) → dict | None
+  fetch_single(norad_id, use_supplemental, user_agent) → dict | None
     成功时返回与 Space-Track GP JSON 字段兼容的 dict（可直接传入 parse_orbit）
     失败时返回 None
 
@@ -10,11 +10,9 @@ CelesTrak 单星查询封装 + 每星频率控制
   每颗卫星至少间隔 CELESTRAK_MIN_INTERVAL 秒才允许再次请求
   调用方应在外层再做一次全局间隔保护（写在了 spacetrack_monitor 主循环）
 
-TODO (5位编号耗尽预案, 预计 2026-07-20 后生效):
-  届时传统 TLE_LINE1/TLE_LINE2 字段将不再由 CelesTrak 提供。
-  fetch_single 返回结构中已保留 _orbital_elements 字段存储原始根数 dict，
-  届时在 parse_orbit 中增加回退逻辑：当 tle_line1 为空时，
-  改用 _orbital_elements 序列化后计算 hash，并跳过 TLE 文本存储。
+5位编号耗尽预案:
+  fetch_single 返回结构中已保留 _raw_elements 字段存储原始根数 dict，
+  供 xpropagator_client.gp_json_to_tle_lines() 在 tle1/tle2 为空时重建 TLE。
 """
 
 from __future__ import annotations
@@ -35,9 +33,8 @@ CELESTRAK_SUP_GP_URL = "https://celestrak.org/NORAD/elements/supplemental/sup-gp
 CELESTRAK_MIN_INTERVAL: int = 7200  # 秒
 
 # User-Agent（可选，用于标识应用身份）
-# 如果设置了环境变量 CELESTRAK_USER_AGENT，则使用该值；否则不设置 UA
-import os as _os
-_USER_AGENT: Optional[str] = _os.getenv("CELESTRAK_USER_AGENT") or None
+# 由调用方通过 fetch_single 的 user_agent 参数传入，不再从环境变量读取
+# 这样可以统一从 config.yaml 管理所有数据源的 UA 配置
 
 # 每颗卫星的上次请求时间戳 {norad_id: monotonic_time}
 _last_query: dict[int, float] = {}
@@ -59,11 +56,16 @@ def fetch_single(
     norad_id: int,
     use_supplemental: bool = False,
     timeout: int = 20,
+    user_agent: Optional[str] = None,
 ) -> Optional[dict]:
     """
     向 CelesTrak 查询单颗卫星的 GP 数据（JSON 格式）。
     返回第一条记录（dict），字段与 Space-Track GP JSON 兼容；失败返回 None。
-    调用前请先检查 seconds_since_last_query 以避免过于频繁请求。
+    Args:
+        norad_id: NORAD 编号
+        use_supplemental: 是否使用 SupGP 接口
+        timeout: 请求超时时间（秒）
+        user_agent: User-Agent 字符串，可选。由调用方统一从 config.yaml 传入。
     """
     url = CELESTRAK_SUP_GP_URL if use_supplemental else CELESTRAK_GP_URL
     params = {"CATNR": str(norad_id), "FORMAT": "json"}
@@ -71,8 +73,8 @@ def fetch_single(
     for attempt in range(1, 3):  # 最多重试一次
         try:
             headers = {}
-            if _USER_AGENT:
-                headers["User-Agent"] = _USER_AGENT
+            if user_agent:
+                headers["User-Agent"] = user_agent
             resp = requests.get(
                 url,
                 params=params,
@@ -113,8 +115,9 @@ def fetch_single(
         # 注入来源标识，供 log_record 使用
         record["_source"] = "celestrak_sup" if use_supplemental else "celestrak"
         
-        # TODO (5位编号耗尽预案): 保留原始根数，TLE 字段消失后作为 hash 输入
-        # 同时供 xpropagator_client.gp_json_to_tle_lines() 在 tle1/tle2 为空时重建 TLE
+        # 保留原始根数，供以下场景使用：
+        # 1. 5位编号耗尽后（~2026-07-20），TLE_LINE1/2 不再提供时，用于重建 TLE
+        # 2. xpropagator_client.gp_json_to_tle_lines() 在 tle1/tle2 为空时合成 TLE
         record["_raw_elements"] = {
             k: record.get(k)
             for k in ("NORAD_CAT_ID", "OBJECT_ID", "OBJECT_NAME", "EPOCH",

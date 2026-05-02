@@ -82,8 +82,18 @@ class StateVector(NamedTuple):
 # ── 内部工具函数 ──────────────────────────────────────────────────────────────────
 
 def _parse_epoch_utc(epoch_str: str) -> Optional[datetime]:
-    # 解析 EPOCH 字符串为 UTC
-    if not epoch_str:
+    """
+    解析 ISO 时间字符串为 UTC datetime 对象。
+    
+    支持格式：
+    - 带/不带微秒："%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S"
+    - 空格分隔："%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"
+    - 带时区："%Y-%m-%dT%H:%M:%S.%f%z", "%Y-%m-%dT%H:%M:%S%z"
+    
+    如果输入无时区信息，假设为 UTC；如果有时区，转换为 UTC。
+    解析失败返回 None。
+    """
+    if not epoch_str or not isinstance(epoch_str, str):
         return None
     for fmt in (
         "%Y-%m-%dT%H:%M:%S.%f",
@@ -140,9 +150,8 @@ def propagate_tle(
         )
         stub = pb2_grpc.PropagatorStub(channel)
 
-        # 生成随机伪 NORAD ID（80000-99999 范围，避免与真实卫星冲突）
-        # 稳定版（相同TLE复用缓存，节省内存）
-        fake_id = 80000 + (hash(tle1 + tle2) % 20000)
+        # 生成伪 NORAD ID（80000-99999），融合真实 norad_id 避免 5 位编号耗尽后的哈希冲突
+        fake_id = 80000 + (hash(f"{norad_id}:{tle1}:{tle2}") % 20000)
 
         # 绝对防缓存版（每次都不同，需配合定期重启清理累积对象）
         # fake_id = 80000 + int(time.time() * 1000) % 20000
@@ -189,13 +198,9 @@ def position_residual_km(sv_a: StateVector, sv_b: StateVector) -> float:
     )
 
 def _resolve_tle(orbit_dict: dict) -> tuple[str, str] | None:
-    """
-    从 orbit dict 中获取 TLE 两行。
-    有现成 tle1/tle2 则直接返回；否则尝试从 _raw_elements 合成；
-    两者均缺失则返回 None。
-    """
+    """从 orbit dict 获取 TLE，优先使用现成数据，缺失时从 _raw_elements 合成。"""
     tle1, tle2 = orbit_dict.get("tle1", ""), orbit_dict.get("tle2", "")
-    if tle1:
+    if tle1 and tle2:  # 完整性校验
         log.debug("xprop: 使用现成 TLE [NORAD %d]", orbit_dict.get("norad"))
         return tle1, tle2
 
@@ -334,22 +339,36 @@ def _tle_checksum(line: str) -> int:
 # 没有办法的办法：使用 fake_id 创建一个临时的 TLE
 def _spoof_catalog_id(tle1: str, tle2: str, fake_id: int) -> tuple[str, str]:
     """
-    把 TLE 两行里的卫星编号替换为 fake_id，并重算校验位。
-    增加防御：确保行长度为 69 字符。
+    替换 TLE 中的卫星编号为 fake_id 并重算校验位，用于绕过 xpropagator 缓存。
     """
-    # 防御：去除首尾空白，截断为 69 字符
-    tle1 = tle1.strip()[:69]
-    tle2 = tle2.strip()[:69]
+    # 防御：去除首尾空白
+    tle1 = tle1.strip()
+    tle2 = tle2.strip()
+    
+    # 确保长度至少 7 字符（容纳编号替换），不足填充，超出截断
+    if len(tle1) < 7:
+        tle1 = tle1.ljust(69)
+    elif len(tle1) < 69:
+        tle1 = tle1.ljust(69)
+    elif len(tle1) > 69:
+        tle1 = tle1[:69]
+        
+    if len(tle2) < 7:
+        tle2 = tle2.ljust(69)
+    elif len(tle2) < 69:
+        tle2 = tle2.ljust(69)
+    elif len(tle2) > 69:
+        tle2 = tle2[:69]
 
     id_str = f"{fake_id:5d}"  # 5位右对齐
 
-    # 替换 line1 卫星编号（列2-6）并重算校验位
+    # 替换 line1 卫星编号（列2-6，0-indexed）并重算校验位
     l1 = list(tle1)
     l1[2:7] = list(id_str)
     l1[68] = str(_tle_checksum("".join(l1)))
     new_tle1 = "".join(l1)
 
-    # 替换 line2 卫星编号（列2-6）并重算校验位
+    # 替换 line2 卫星编号（列2-6，0-indexed）并重算校验位
     l2 = list(tle2)
     l2[2:7] = list(id_str)
     l2[68] = str(_tle_checksum("".join(l2)))
@@ -358,12 +377,11 @@ def _spoof_catalog_id(tle1: str, tle2: str, fake_id: int) -> tuple[str, str]:
     return new_tle1, new_tle2
 
 # TLE 合成辅助函数
-# 用于在 TLE_LINE1/TLE_LINE2 缺失时（5位编号耗尽后）从 GP JSON 根数重建 TLE 两行。
+# 用于在 TLE_LINE1/TLE_LINE2 缺失时（5位编号耗尽后 ~2026-07-20）从 GP JSON 根数重建 TLE 两行。
 # xpropagator gRPC 接口只接受 TLE 文本，合成在客户端完成，服务端完全透明。
 #
-# TODO (5位编号耗尽预案, ~2026-07-20):
-# 届时需验证合成逻辑在新编目体系下的正确性（历元格式、编号处理等）。
-# 当前实现已通过 5 位编号范围内的样本验证。
+# 注意：当前实现已通过 5 位编号范围内的样本验证。
+# 5位编号耗尽后需验证合成逻辑在新编目体系下的正确性（历元格式、编号处理等）。
 
 def _epoch_to_tle_str(epoch_str: str) -> str:
     """将 ISO 历元字符串转换为 TLE 历元格式 YYDDD.DDDDDDDD"""
@@ -428,15 +446,12 @@ def _format_intl_designator(object_id: str) -> str:
 
 def gp_json_to_tle_lines(gp: dict) -> tuple[str, str]:
     """
-    从 CelesTrak / Space-Track GP JSON 根数字段合成标准 TLE 两行（各 69 字符）。
-
-    合成的编目号使用 min(NORAD_CAT_ID, 99999) 作为占位符——
-    调用方（propagate_tle）会通过 _spoof_catalog_id 将其替换为基于 TLE
-    内容 hash 的伪 ID 并重算校验位，因此这里写入的编目号对 xpropagator 不可见。
-
-    TODO (5位编号耗尽预案, ~2026-07-20):
-    届时 TLE_LINE1/TLE_LINE2 将不再提供，此函数作为唯一回退路径被激活。
-    届时需验证历元格式、根数精度在新编目体系下的正确性。
+    从 GP JSON 根数合成标准 TLE 两行（各 69 字符）
+    
+    编目号使用 min(NORAD_CAT_ID, 99999) 占位，调用方会通过 _spoof_catalog_id
+    替换为基于真实 norad_id 的伪 ID，因此这里的截断不影响最终结果
+    
+    5位编号耗尽后作为回退路径激活
     """
     norad_id = int(gp.get("NORAD_CAT_ID") or 0)
     # 占位用，进入 propagate_tle 后必然被 _spoof_catalog_id 覆盖
@@ -476,7 +491,11 @@ def gp_json_to_tle_lines(gp: dict) -> tuple[str, str]:
         f"{ephem_type} "
         f"{elem_set_no:4d}"
     )
-    assert len(line1_body) == 68, f"Line1 长度异常: {len(line1_body)}"
+    if len(line1_body) != 68:
+        raise ValueError(
+            f"TLE Line 1 长度异常: 期望 68 字符，实际 {len(line1_body)} 字符。"
+            f"可能原因：根数字段格式化错误或输入数据不完整。"
+        )
     line1 = line1_body + str(_tle_checksum(line1_body + "0"))  # 加占位符凑齐69字符
 
     # ── Line 2（68字符正文 + 1字符校验）──
@@ -494,7 +513,11 @@ def gp_json_to_tle_lines(gp: dict) -> tuple[str, str]:
         f"{mm:11.8f}"  # 平均运动（11字符），直接拼接圈号
         f"{rev:5d}"
     )
-    assert len(line2_body) == 68, f"Line2 长度异常: {len(line2_body)}"
+    if len(line2_body) != 68:
+        raise ValueError(
+            f"TLE Line 2 长度异常: 期望 68 字符，实际 {len(line2_body)} 字符。"
+            f"可能原因：根数字段格式化错误或输入数据不完整。"
+        )
     line2 = line2_body + str(_tle_checksum(line2_body + "0"))  # 加占位符凑齐69字符
 
     return line1, line2

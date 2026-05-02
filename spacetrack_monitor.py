@@ -147,12 +147,13 @@ log = logging.getLogger(__name__)
 
 # xpropagator 客户端（插件式，找不到模块时自动禁用）
 try:
-    from xpropagator_client import classify_change_xprop, is_service_alive
+    from xpropagator_client import classify_change_xprop, is_service_alive, _parse_epoch_utc
     _XPROP_MODULE_OK = True
 except ImportError:
     _XPROP_MODULE_OK = False
     classify_change_xprop = None   # type: ignore 忽略
     is_service_alive = None  # type: ignore 忽略
+    _parse_epoch_utc = None  # type: ignore 忽略
 
 # 实际是否可用 = 配置开启 + 模块导入成功
 XPROP_ACTIVE: bool = XPROP_ENABLED and _XPROP_MODULE_OK
@@ -173,7 +174,18 @@ def rotate_file_if_needed(filepath: str, max_size: int = MAX_LOG_SIZE) -> None:
 
 
 def parse_datetime_utc(value: object) -> Optional[datetime]:
-    """将 Space-Track 返回的 ISO 时间字符串转换为 UTC datetime 对象"""
+    """
+    将 Space-Track 返回的 ISO 时间字符串转换为 UTC datetime 对象。
+    
+    复用 xpropagator_client._parse_epoch_utc，保持行为一致。
+    如果 xpropagator_client 模块不可用，使用本地实现作为回退。
+    """
+    if _XPROP_MODULE_OK and _parse_epoch_utc is not None:
+        # 优先使用统一的时间解析函数
+        # 注意：None 值需要特殊处理，避免 str(None) 变成 "None" 字符串
+        return _parse_epoch_utc(str(value) if value is not None else "")
+    
+    # 回退实现（当 xpropagator_client 不可用时）
     if not value or not isinstance(value, str):
         return None
     try:
@@ -588,14 +600,41 @@ def format_change_type(change_type: str) -> str:
 
 
 def parse_orbit(record: dict) -> dict:
-    # 从提取轨道参数并计算哈希值
+    """
+    从 Space-Track/CelesTrak 记录中提取轨道参数并计算哈希值。
+    
+    Hash 计算策略：
+    1. 优先使用 TLE_LINE1 + TLE_LINE2（传统方式）
+    2. 回退：当 TLE 为空时，使用 _raw_elements 序列化为 JSON 后计算 hash
+       （5位编号耗尽后 ~2026-07-20 的主要方式）
+    3. 如果两者均缺失，抛出 ValueError（数据不完整，无法继续处理）
+    """
     name = (record.get("OBJECT_NAME") or "").strip()
     tle1 = str(record.get("TLE_LINE1") or "")
     tle2 = str(record.get("TLE_LINE2") or "")
-    # 使用 TLE 两行数据的 SHA256 哈希作为唯一标识
-    tle_hash = hashlib.sha256((tle1 + tle2).encode("utf-8")).hexdigest()[:16]
+    norad_id = int(record.get("NORAD_CAT_ID") or 0)
+    
+    # 计算 TLE 哈希：优先使用 TLE 文本，如果为空则使用原始根数
+    if tle1 and tle2:
+        # 传统方式：使用 TLE 两行数据的 SHA256 哈希
+        tle_hash = hashlib.sha256((tle1 + tle2).encode("utf-8")).hexdigest()[:16]
+    else:
+        # 5位编号耗尽后（~2026-07-20），TLE_LINE1/2 不再提供，改用 _raw_elements 计算 hash
+        raw_elements = record.get("_raw_elements", {})
+        if raw_elements:
+            # 将原始根数字典序列化为 JSON 字符串后计算 hash
+            raw_str = json.dumps(raw_elements, sort_keys=True, ensure_ascii=False)
+            tle_hash = hashlib.sha256(raw_str.encode("utf-8")).hexdigest()[:16]
+            log.debug("[NORAD %d] TLE 文本为空，使用 _raw_elements 计算 hash", norad_id)
+        else:
+            # 数据不完整：既无 TLE 也无原始根数，无法继续处理
+            raise ValueError(
+                f"[NORAD {norad_id}] 轨道数据不完整：既无 TLE_LINE1/TLE_LINE2，"
+                f"也无 _raw_elements。无法计算 hash，请检查数据源返回格式。"
+            )
+    
     return {
-        "norad": int(record.get("NORAD_CAT_ID") or 0),
+        "norad": norad_id,
         "name": name or "TBA",
         "intl_id": record.get("OBJECT_ID", ""),
         "epoch": record.get("EPOCH", ""),
@@ -608,10 +647,9 @@ def parse_orbit(record: dict) -> dict:
         "tle1": tle1,
         "tle2": tle2,
         "tle_hash": tle_hash,
-        # TODO (5位编号耗尽预案, ~2026-07-20):
-        # 届时 TLE_LINE1/TLE_LINE2 将不再提供。
-        # _raw_elements 保存原始根数，供 xpropagator_client.gp_json_to_tle_lines()
-        # 在 tle1/tle2 为空时重建 TLE 两行以维持残差分析能力。
+        # 原始根数，供以下场景使用：
+        # 1. 5位编号耗尽后（~2026-07-20），TLE_LINE1/2 不再提供时，用于重建 TLE
+        # 2. xpropagator_client.gp_json_to_tle_lines() 在 tle1/tle2 为空时合成 TLE
         "_raw_elements": {
             "NORAD_CAT_ID": record.get("NORAD_CAT_ID"),
             "OBJECT_ID": record.get("OBJECT_ID"),
@@ -828,7 +866,12 @@ def process_records(
         batch_count = record.pop("_batch_count", 1)
         
         # 解析轨道参数并计算 Hash
-        orbit = parse_orbit(record)
+        try:
+            orbit = parse_orbit(record)
+        except ValueError as e:
+            log.error("[%d] 轨道数据解析失败，跳过该记录: %s", norad_id, e)
+            continue
+        
         prev = prev_data.get(norad_id)
         cur_hash = orbit["tle_hash"]
 
@@ -882,11 +925,19 @@ def cold_start_if_needed(norad_ids: list[int], prev_data: dict[int, dict]) -> No
 
     log.info("冷启动：以下卫星无历史记录，将通过 CelesTrak 获取初始基准: %s", missing)
     for nid in missing:
-        record = ct.fetch_single(nid, use_supplemental=USE_SUPPLEMENTAL)
+        record = ct.fetch_single(
+            nid, 
+            use_supplemental=USE_SUPPLEMENTAL,
+            user_agent=SPACE_TRACK_USER_AGENT,  # 统一从 config.yaml 传入 UA
+        )
         if record is None:
             log.warning("[冷启动][%d] CelesTrak 查询失败，本轮跳过", nid)
             continue
-        orbit = parse_orbit(record)
+        try:
+            orbit = parse_orbit(record)
+        except ValueError as e:
+            log.error("[冷启动][%d] 轨道数据解析失败，跳过: %s", nid, e)
+            continue
         log.info("[冷启动][%d] %s 初始基准已入库", nid, orbit["name"])
         log_record(orbit, change_type="initial", source=record.get("_source", "celestrak"))
         prev_data[nid] = orbit
@@ -911,13 +962,22 @@ def run_celestrak_cycle(
             log.debug("[CelesTrak][%d] 距上次查询 %.0f 分钟，跳过本轮", nid, secs / 60)
             continue  # 跳过不算成功也不算失败
 
-        record = ct.fetch_single(nid, use_supplemental=USE_SUPPLEMENTAL)
+        record = ct.fetch_single(
+            nid,
+            use_supplemental=USE_SUPPLEMENTAL,
+            user_agent=SPACE_TRACK_USER_AGENT,  # 统一从 config.yaml 传入 UA
+        )
         if record is None:
             log.warning("[CelesTrak][%d] 查询失败", nid)
             continue
 
         any_success = True
-        orbit = parse_orbit(record)
+        try:
+            orbit = parse_orbit(record)
+        except ValueError as e:
+            log.error("[CelesTrak][%d] 轨道数据解析失败，跳过: %s", nid, e)
+            continue
+        
         cur_hash = orbit["tle_hash"]
         record_source = record.get("_source", "celestrak")
 
