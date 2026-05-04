@@ -14,9 +14,16 @@ from xpropagator_client import (
     is_service_alive,
     propagate_tle,
     classify_change_xprop,
+    state_vector_to_keplerian,
+    StateVector,
 )
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+import json
+import os
 import sys
+import tempfile
+
+import decay_tracker as dt
 
 
 def test_service_connection():
@@ -135,7 +142,7 @@ def test_correction_detection():
     orbit = {
         "norad": 25544,
         "name": "ISS (ZARYA)",
-        "epoch": "2026-04-29T10:40:00",  # ← 相同历元
+        "epoch": "2026-04-29T10:40:00",
         "tle1": "1 25544U 98067A   26119.43750000  .00003201  00000-0  17000-3 0  9981",
         "tle2": "2 25544  51.6486 208.5000 0006400  60.5000  25.0000 15.49500001123400",
     }
@@ -266,16 +273,574 @@ def test_no_tle_synthesis():
         return False
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# Phase 1: 衰降追踪器测试
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _make_synthetic_data(
+    norad_id: int,
+    name: str,
+    num_points: int,
+    base_peri_km: float,
+    base_apo_km: float,
+    base_bstar: float,
+    peri_decline_rate: float,      # km/day (正值为下降)
+    bstar_growth_rate: float,      # 倍数/30天
+    bstar_accel_onset_day: float,  # B* 从第几天开始加速增长
+    days_span: float = 60.0,
+) -> list[dict]:
+    """
+    生成合成的衰降历史数据。
+
+    规律：
+    - periapsis/apoapsis 大致线性下降，叠加少量噪声
+    - B* 前期稳定，bstar_accel_onset_day 后开始指数加速
+    - 每 2 天一条记录（模拟真实 TLE 更新频率）
+    """
+    records = []
+    now = datetime.now(timezone.utc)
+
+    for i in range(num_points):
+        day = i * days_span / num_points
+        ts = now - timedelta(days=days_span - day)
+
+        # 近/远地点：线性下降 + 后期加速（模拟阻力效应增强）
+        if day < bstar_accel_onset_day:
+            peri = base_peri_km - peri_decline_rate * day * 0.3
+            apo = base_apo_km - peri_decline_rate * day * 0.3
+        else:
+            days_into_accel = day - bstar_accel_onset_day
+            peri = (base_peri_km
+                    - peri_decline_rate * bstar_accel_onset_day * 0.3
+                    - peri_decline_rate * days_into_accel * 1.0)
+            apo = (base_apo_km
+                   - peri_decline_rate * bstar_accel_onset_day * 0.3
+                   - peri_decline_rate * days_into_accel * 1.0)
+
+        # B*：前期稳定 + 后期指数加速
+        if day < bstar_accel_onset_day:
+            bstar = base_bstar * (1.0 + 0.02 * day)  # 轻微线性漂移
+        else:
+            days_into_accel = day - bstar_accel_onset_day
+            bstar = base_bstar * (bstar_growth_rate ** (days_into_accel / 30.0))
+
+        # 添加 ±5% 噪声
+        import random
+        noise = 1.0 + random.uniform(-0.05, 0.05)
+        peri *= noise
+        apo *= (noise + random.uniform(-0.01, 0.01))  # 远地点噪声略大
+        bstar *= noise
+
+        # 确保近地点不小于 0
+        peri = max(peri, 50.0)
+        apo = max(apo, peri + 5.0)
+
+        # 从近/远地点反推物理一致的轨道根数（开普勒第三定律）
+        mu = 398600.4418
+        r_e = 6378.137
+        sma = (peri + apo + 2.0 * r_e) / 2.0         # 半长轴 (km)
+        ecc_val = (apo - peri) / (apo + peri + 2.0 * r_e)
+        ecc_val = max(ecc_val, 1e-9)                  # 避免零离心率导致数值问题
+        n_rad_s = (mu / sma ** 3) ** 0.5             # 平均运动 (rad/s)
+        mean_motion = n_rad_s * 86400.0 / (2.0 * 3.141592653589793)  # rev/day
+        period_min = 1440.0 / mean_motion             # 周期 (min)
+        epoch_str = (ts - timedelta(hours=random.uniform(0, 2))).isoformat()
+
+        record = {
+            "timestamp": ts.isoformat(),
+            "change_type": "correction" if i > 0 else "initial",
+            "source": "synthetic",
+            "norad": norad_id,
+            "name": name,
+            "intl_id": f"2099-{norad_id % 1000:03d}A",
+            "epoch": epoch_str,
+            "periapsis": round(peri, 2),
+            "apoapsis": round(apo, 2),
+            "incl": 51.64,
+            "period": round(period_min, 2),
+            "ecc": ecc_val,
+            "bstar": bstar,
+            "tle1": "",
+            "tle2": "",
+            "tle_hash": f"synthetic_{norad_id}_{i:04d}",
+            # GP JSON 根数，支持 _resolve_tle() → gp_json_to_tle_lines() 合成 TLE
+            "_raw_elements": {
+                "NORAD_CAT_ID": norad_id,
+                "OBJECT_ID": f"2099-{norad_id % 1000:03d}A",
+                "OBJECT_NAME": name,
+                "EPOCH": epoch_str,
+                "CLASSIFICATION_TYPE": "U",
+                "ELEMENT_SET_NO": i + 1,
+                "EPHEMERIS_TYPE": 0,
+                "INCLINATION": 51.64,
+                "RA_OF_ASC_NODE": (200.0 + i * 0.5) % 360.0,
+                "ECCENTRICITY": ecc_val,
+                "ARG_OF_PERICENTER": (100.0 + i * 0.3) % 360.0,
+                "MEAN_ANOMALY": (i * 360.0 / num_points * 16.0) % 360.0,
+                "MEAN_MOTION": mean_motion,
+                "MEAN_MOTION_DOT": 0.0,
+                "MEAN_MOTION_DDOT": 0.0,
+                # SGP4 对过高 B* 不稳定（偏心率变负/半长轴爆炸）
+                # TLE 合成的 B* 限制在安全范围，趋势分析仍用原始 bstar 值
+                "BSTAR": min(bstar, 5e-4),
+                "REV_AT_EPOCH": i * 16,
+            },
+        }
+        records.append(record)
+
+    return records
+
+
+def _write_temp_jsonl(records: list[dict]) -> str:
+    """将记录写入临时 JSONL 文件，返回路径"""
+    fd, path = tempfile.mkstemp(suffix=".jsonl", prefix="decay_test_")
+    os.close(fd)
+    with open(path, "w", encoding="utf-8") as f:
+        for rec in records:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    return path
+
+
+def _print_forecast_detail(trend: dict) -> None:
+    """打印前向传播触发决策的详细过程"""
+    trigger_method = trend.get("trigger_method", "unknown")
+    print(f"  触发方式: {trigger_method}")
+
+    if trigger_method != "physics_propagation":
+        return
+
+    pts = trend.get("forecast_points", 0)
+    slope = trend.get("forecast_apo_slope_km_per_day", 0)
+    r2 = trend.get("forecast_apo_r2", 0)
+    total_decline = trend.get("forecast_total_apo_decline_km", 0)
+    apo_series = trend.get("forecast_apo_series", [])
+
+    print(f"  前向传播: {pts} 个有效点 / 30 天窗口")
+    if apo_series:
+        print(f"    历元远地点: {apo_series[0]:.1f} km")
+        if len(apo_series) > 1:
+            print(f"    30天后远地点: {apo_series[-1]:.1f} km")
+    print(f"    远地点变化率: {slope:+.3f} km/天  (R^2={r2:.3f})")
+    print(f"    累计变化: {total_decline:+.1f} km")
+
+    # 触发条件判断
+    conditions = []
+    decline_sustained = slope < 0 and r2 >= dt.FORWARD_TRIGGER_MIN_R2
+    decline_significant = abs(total_decline) >= dt.FORWARD_TRIGGER_MIN_DECLINE_KM
+    terminal_low = apo_series and apo_series[-1] < dt.FORWARD_TRIGGER_TERMINAL_APO_KM
+
+    c1 = "[OK]" if decline_sustained else "[  ]"
+    conditions.append(
+        f"    {c1} 趋势可信 (斜率<0 且 R^2>={dt.FORWARD_TRIGGER_MIN_R2}): "
+        f"斜率={slope:+.3f}, R^2={r2:.3f}"
+    )
+    c2 = "[OK]" if decline_significant else "[  ]"
+    conditions.append(
+        f"    {c2} 下降显著 (|总变化|>={dt.FORWARD_TRIGGER_MIN_DECLINE_KM} km): "
+        f"|{total_decline:.1f}| km"
+    )
+    c3 = "[OK]" if terminal_low else "[  ]"
+    conditions.append(
+        f"    {c3} 终点过低 (最终远地点<{dt.FORWARD_TRIGGER_TERMINAL_APO_KM} km): "
+        f"{apo_series[-1]:.1f} km" if apo_series else "    {c3} 终点过低: N/A"
+    )
+    for c in conditions:
+        print(c)
+
+    triggered = (decline_sustained and decline_significant) or terminal_low
+    reasons = []
+    if decline_sustained and decline_significant:
+        reasons.append("趋势可信+下降显著")
+    if terminal_low:
+        reasons.append("终点过低")
+    reason_str = " 且 ".join(reasons) if reasons else "无"
+    print(f"  触发判定: {'触发' if triggered else '不触发'} ({reason_str})")
+
+
+def test_decay_normal_orbit():
+    """测试 6: 衰降分析 - 正常轨道（远地点 > 300 km）"""
+    print("=" * 60)
+    print("测试 6: 衰降分析 - 正常轨道 (ISS)")
+    print("=" * 60)
+
+    records = _make_synthetic_data(
+        norad_id=25544, name="ISS (TEST)",
+        num_points=30, base_peri_km=415.0, base_apo_km=425.0,
+        base_bstar=1.5e-4, peri_decline_rate=0.0,
+        bstar_growth_rate=1.0, bstar_accel_onset_day=999,
+    )
+    tmp = _write_temp_jsonl(records)
+
+    orbit = records[-1]  # 当前状态（最新记录）
+    analysis = dt.analyze_decay(orbit, tmp)
+    os.unlink(tmp)
+
+    _print_forecast_detail(analysis.get("trend", {}))
+    print(f"  判定阶段: {analysis['phase']} ({dt.PHASE_LABELS[analysis['phase']]})")
+    print(f"  预期: normal (正常)")
+
+    if analysis["phase"] == dt.DecayPhase.NORMAL:
+        print("  [OK] 通过")
+        return True
+    else:
+        print(f"  [FAIL] 预期 normal，实际 {analysis['phase']}")
+        return False
+
+
+def test_decay_early_insufficient_data():
+    """测试 7: 衰降分析 - 早期衰减（数据不足）"""
+    print("\n" + "=" * 60)
+    print("测试 7: 衰降分析 - 早期衰减（历史数据不足）")
+    print("=" * 60)
+
+    records = _make_synthetic_data(
+        norad_id=70001, name="DECAY-EARLY-NODATA",
+        num_points=3, base_peri_km=270.0, base_apo_km=285.0,
+        base_bstar=3e-4, peri_decline_rate=0.1,
+        bstar_growth_rate=1.0, bstar_accel_onset_day=999,
+    )
+    tmp = _write_temp_jsonl(records)
+
+    orbit = records[-1]
+    analysis = dt.analyze_decay(orbit, tmp)
+    os.unlink(tmp)
+
+    _print_forecast_detail(analysis.get("trend", {}))
+    print(f"  近地点: {analysis['periapsis']:.1f} km / 远地点: {analysis['apoapsis']:.1f} km")
+    print(f"  历史记录: {len(records)} 条 (最少需要 {dt.MIN_DATA_POINTS} 条)")
+    print(f"  判定阶段: {analysis['phase']} ({dt.PHASE_LABELS[analysis['phase']]})")
+    print(f"  告警: {analysis['alert']}")
+    print(f"  预期: early_decay (早期衰减)")
+
+    if analysis["phase"] == dt.DecayPhase.EARLY:
+        print("  [OK] 通过")
+        return True
+    else:
+        print(f"  [FAIL] 预期 early_decay，实际 {analysis['phase']}")
+        return False
+
+
+def test_decay_early_stable():
+    """测试 8: 衰降分析 - 早期衰减（有数据但无加速趋势）"""
+    print("\n" + "=" * 60)
+    print("测试 8: 衰降分析 - 早期衰减（稳定 B*）")
+    print("=" * 60)
+
+    records = _make_synthetic_data(
+        norad_id=70002, name="DECAY-STABLE",
+        num_points=20, base_peri_km=270.0, base_apo_km=285.0,
+        base_bstar=2e-4, peri_decline_rate=0.05,
+        bstar_growth_rate=1.0,       # B* 不增长
+        bstar_accel_onset_day=999,   # 永不触发加速
+    )
+    tmp = _write_temp_jsonl(records)
+
+    orbit = records[-1]
+    analysis = dt.analyze_decay(orbit, tmp)
+    os.unlink(tmp)
+
+    _print_forecast_detail(analysis.get("trend", {}))
+    print(f"  近地点: {analysis['periapsis']:.1f} km / 远地点: {analysis['apoapsis']:.1f} km")
+    trend = analysis.get("trend", {})
+    bstar_ratio = trend.get("bstar_ratio", 1.0)
+    print(f"  B* 短期/长期比值: {bstar_ratio:.2f}x (加速阈值 {dt.BSTAR_ACCELERATION_FACTOR}x)")
+    print(f"  判定阶段: {analysis['phase']} ({dt.PHASE_LABELS[analysis['phase']]})")
+    print(f"  预期: early_decay（B* 未加速，无明确趋势）")
+
+    if analysis["phase"] == dt.DecayPhase.EARLY:
+        print("  [OK] 通过")
+        return True
+    else:
+        print(f"  [FAIL] 预期 early_decay，实际 {analysis['phase']}")
+        return False
+
+
+def test_decay_accelerating():
+    """测试 9: 衰降分析 - 加速衰减（B* 快速增长 + 近地点下降）"""
+    print("\n" + "=" * 60)
+    print("测试 9: 衰降分析 - 加速衰减")
+    print("=" * 60)
+
+    records = _make_synthetic_data(
+        norad_id=70003, name="DECAY-ACCEL",
+        num_points=40, base_peri_km=295.0, base_apo_km=305.0,
+        base_bstar=1e-4, peri_decline_rate=1.5,
+        bstar_growth_rate=80.0,                    # 30天增长 80x → B* 比值远超 3x 阈值
+        bstar_accel_onset_day=25.0,
+    )
+    tmp = _write_temp_jsonl(records)
+
+    orbit = records[-1]
+    analysis = dt.analyze_decay(orbit, tmp)
+    os.unlink(tmp)
+
+    trend = analysis.get("trend", {})
+    _print_forecast_detail(trend)
+    print(f"  远地点: {analysis['apoapsis']:.1f} km  近地点: {analysis['periapsis']:.1f} km")
+    print(f"  B* 短期中位数: {trend.get('bstar_short_median', 0):.4e}")
+    print(f"  B* 长期中位数: {trend.get('bstar_long_median', 0):.4e}")
+    print(f"  B* 短期/长期比值: {trend.get('bstar_ratio', 0):.2f}x (阈值 {dt.BSTAR_ACCELERATION_FACTOR}x)")
+    print(f"  近地点变化率: {trend.get('peri_slope_km_per_day', 0):.3f} km/天")
+    print(f"  近地点 R^2: {trend.get('peri_r2', 0):.3f}")
+    print(f"  判定阶段: {analysis['phase']} ({dt.PHASE_LABELS[analysis['phase']]})")
+    print(f"  告警: {analysis['alert']}")
+    print(f"  预期: accelerating（B* 加速 + 近地点下降）")
+
+    if analysis["phase"] == dt.DecayPhase.ACCELERATING:
+        print("  [OK] 通过")
+        return True
+    else:
+        print(f"  [FAIL] 预期 accelerating，实际 {analysis['phase']}")
+        return False
+
+
+def test_decay_critical():
+    """测试 10: 衰降分析 - 危险阶段（近地点 < 200 km）"""
+    print("\n" + "=" * 60)
+    print("测试 10: 衰降分析 - 危险阶段")
+    print("=" * 60)
+
+    records = _make_synthetic_data(
+        norad_id=70004, name="DECAY-CRIT",
+        num_points=30, base_peri_km=260.0, base_apo_km=270.0,
+        base_bstar=5e-4, peri_decline_rate=2.5,   # 快速下降
+        bstar_growth_rate=6.0,                     # 30天增长 6x
+        bstar_accel_onset_day=20.0,
+    )
+    tmp = _write_temp_jsonl(records)
+
+    orbit = records[-1]
+    analysis = dt.analyze_decay(orbit, tmp)
+    os.unlink(tmp)
+
+    trend = analysis.get("trend", {})
+    _print_forecast_detail(trend)
+    print(f"  远地点: {analysis['apoapsis']:.1f} km  近地点: {analysis['periapsis']:.1f} km")
+    print(f"  临界近地点阈值: {dt.DECAY_CRITICAL_PERIAPSIS_KM} km")
+    print(f"  B* 短期中位数: {trend.get('bstar_short_median', 0):.4e}")
+    print(f"  B* 长期中位数: {trend.get('bstar_long_median', 0):.4e}")
+    print(f"  B* 比值: {trend.get('bstar_ratio', 0):.2f}x")
+    print(f"  近地点变化率: {trend.get('peri_slope_km_per_day', 0):.3f} km/天")
+    print(f"  判定阶段: {analysis['phase']} ({dt.PHASE_LABELS[analysis['phase']]})")
+    print(f"  告警: {analysis['alert']}")
+    print(f"  预期: critical（近地点 < 200 km 且 B* 加速）")
+
+    if analysis["phase"] == dt.DecayPhase.CRITICAL:
+        print("  [OK] 通过")
+        return True
+    else:
+        print(f"  [FAIL] 预期 critical，实际 {analysis['phase']}")
+        return False
+
+
+def test_decay_csv_export():
+    """测试 11: 衰降分析 - CSV 导出"""
+    print("\n" + "=" * 60)
+    print("测试 11: 衰降分析 - CSV 导出")
+    print("=" * 60)
+
+    records = _make_synthetic_data(
+        norad_id=70005, name="DECAY-CSV-TEST",
+        num_points=15, base_peri_km=250.0, base_apo_km=260.0,
+        base_bstar=1e-3, peri_decline_rate=0.3,
+        bstar_growth_rate=2.0, bstar_accel_onset_day=30.0,
+        days_span=58.0,                            # 避开 60 天边界
+    )
+    tmp = _write_temp_jsonl(records)
+
+    csv_path = dt.export_bstar_csv(70005, tmp, output_dir=tempfile.gettempdir())
+    os.unlink(tmp)
+
+    if csv_path is None:
+        print("  [FAIL] CSV 导出返回 None")
+        return False
+
+    print(f"  导出路径: {csv_path}")
+    with open(csv_path, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+    print(f"  行数: {len(lines)} (含表头)")
+    print(f"  表头: {lines[0].strip()}")
+
+    # 验证列数正确
+    header_cols = lines[0].strip().split(",")
+    expected_cols = ["timestamp", "bstar", "periapsis_km", "apoapsis_km",
+                     "mean_motion_rev_per_day"]
+    if header_cols == expected_cols:
+        print(f"  [OK] 列名正确")
+    else:
+        print(f"  [FAIL] 列名不匹配: {header_cols}")
+        os.unlink(csv_path)
+        return False
+
+    # 验证数据行数与记录数一致
+    data_lines = len(lines) - 1
+    print(f"  数据行: {data_lines} (预期 {len(records)})")
+    if data_lines == len(records):
+        print(f"  [OK] 数据行数正确")
+    else:
+        print(f"  [FAIL] 数据行数不匹配")
+        os.unlink(csv_path)
+        return False
+
+    os.unlink(csv_path)
+    print("  [OK] 通过")
+    return True
+
+
+# ── Phase 1.5: 物理传播触发测试 ──────────────────────────────────────────
+
+def test_eci_to_keplerian_circular():
+    """测试 12: ECI→开普勒转换 - 圆轨道"""
+    print("\n" + "=" * 60)
+    print("测试 12: ECI→开普勒转换 - 近圆轨道")
+    print("=" * 60)
+
+    # Construct a circular equatorial orbit at ~420 km altitude
+    mu = 398600.4418
+    r_e = 6378.137
+    r = r_e + 420.0  # ~6798 km
+    v = (mu / r) ** 0.5  # ~7.66 km/s
+
+    sv = StateVector(x=r, y=0.0, z=0.0, vx=0.0, vy=v, vz=0.0)
+    kep = state_vector_to_keplerian(sv)
+
+    print(f"  半长轴: {kep['semi_major_axis_km']:.2f} km (期望 ~{r:.2f})")
+    print(f"  离心率: {kep['eccentricity']:.6f} (期望 ~0)")
+    print(f"  倾角: {kep['inclination_deg']:.2f} deg (期望 ~0)")
+    print(f"  近地点高度: {kep['periapsis_km']:.2f} km (期望 ~420)")
+    print(f"  远地点高度: {kep['apoapsis_km']:.2f} km (期望 ~420)")
+    print(f"  周期: {kep['period_min']:.2f} min (期望 ~93)")
+
+    ok = True
+    if abs(kep["semi_major_axis_km"] - r) > 5:
+        print("  [FAIL] 半长轴偏差过大")
+        ok = False
+    if kep["eccentricity"] > 0.001:
+        print("  [FAIL] 圆轨道离心率应接近 0")
+        ok = False
+    if abs(kep["periapsis_km"] - 420.0) > 10:
+        print("  [FAIL] 近地点高度偏差过大")
+        ok = False
+    if abs(kep["apoapsis_km"] - 420.0) > 10:
+        print("  [FAIL] 远地点高度偏差过大")
+        ok = False
+    if kep["period_min"] < 85 or kep["period_min"] > 100:
+        print("  [FAIL] 轨道周期不在 LEO 范围")
+        ok = False
+
+    if ok:
+        print("  [OK] 通过")
+    return ok
+
+
+def test_periapsis_fast_track():
+    """测试 13: 物理触发 - 近地点快车道"""
+    print("\n" + "=" * 60)
+    print("测试 13: 物理触发 - 近地点快车道（periapsis < 200 km）")
+    print("=" * 60)
+
+    orbit = {
+        "norad": 80001, "name": "FAST-TRACK",
+        "periapsis": 180.0, "apoapsis": 350.0,
+        "tle1": "", "tle2": "", "epoch": "2026-05-01T00:00:00",
+    }
+    should_trigger, prop_detail = dt._should_trigger_decay_analysis(orbit)
+
+    print(f"  近地点: {orbit['periapsis']} km (< {dt.PERIAPSIS_FAST_TRACK_KM} km)")
+    print(f"  远地点: {orbit['apoapsis']} km")
+    print(f"  触发决策: {should_trigger} (期望 True)")
+    print(f"  传播详情: {prop_detail} (期望 None)")
+
+    if should_trigger and prop_detail is None:
+        print("  [OK] 通过")
+        return True
+    else:
+        print("  [FAIL] 近地点快车道应直接触发，无需传播")
+        return False
+
+
+def test_sensitive_zone_bypass():
+    """测试 14: 物理触发 - 大气敏感区以上跳过"""
+    print("\n" + "=" * 60)
+    print("测试 14: 物理触发 - 敏感区以上跳过（apoapsis >= 300 km）")
+    print("=" * 60)
+
+    orbit = {
+        "norad": 80002, "name": "SAFE-ORBIT",
+        "periapsis": 400.0, "apoapsis": 500.0,
+        "tle1": "", "tle2": "", "epoch": "2026-05-01T00:00:00",
+    }
+    should_trigger, _ = dt._should_trigger_decay_analysis(orbit)
+
+    print(f"  近地点: {orbit['periapsis']} km")
+    print(f"  远地点: {orbit['apoapsis']} km (>= {dt.SENSITIVE_ZONE_KM} km)")
+    print(f"  触发决策: {should_trigger} (期望 False)")
+
+    if not should_trigger:
+        print("  [OK] 通过")
+        return True
+    else:
+        print("  [FAIL] 远地点在敏感区以上不应触发")
+        return False
+
+
+def test_static_fallback_trigger():
+    """测试 15: 物理触发 - xprop 不可用时回退静态阈值"""
+    print("\n" + "=" * 60)
+    print("测试 15: 物理触发 - 回退静态阈值（xprop 不可用）")
+    print("=" * 60)
+
+    # Case A: apoapsis < 300 → triggers via fallback
+    orbit_low = {
+        "norad": 80003, "name": "FALLBACK-LOW",
+        "periapsis": 250.0, "apoapsis": 280.0,
+        "tle1": "", "tle2": "", "epoch": "2026-05-01T00:00:00",
+    }
+    should_trigger_low, _ = dt._should_trigger_decay_analysis(orbit_low)
+    print(f"  情况 A — 远地点 {orbit_low['apoapsis']} km < {dt.DECAY_APOAPSIS_THRESHOLD_KM} km")
+    print(f"    触发决策: {should_trigger_low} (期望 True)")
+
+    # Case B: periapsis < 200 → fast-track regardless of xprop
+    orbit_fast = {
+        "norad": 80004, "name": "FAST-ANYWAY",
+        "periapsis": 190.0, "apoapsis": 280.0,
+        "tle1": "", "tle2": "", "epoch": "2026-05-01T00:00:00",
+    }
+    should_trigger_fast, _ = dt._should_trigger_decay_analysis(orbit_fast)
+    print(f"  情况 B — 近地点 {orbit_fast['periapsis']} km < {dt.PERIAPSIS_FAST_TRACK_KM} km")
+    print(f"    触发决策: {should_trigger_fast} (期望 True)")
+
+    ok = should_trigger_low and should_trigger_fast
+    if ok:
+        print("  [OK] 通过")
+    else:
+        print("  [FAIL] 回退/快车道逻辑不正确")
+    return ok
+
+
 def main():
     """运行所有测试"""
     print("\n" + "xpropagator 集成测试套件".center(50) + "\n")
-    
+
     tests = [
+        # xpropagator 集成测试
         ("服务连接", test_service_connection),
         ("单次预报", test_single_propagation),
         ("残差分析(机动)", test_maneuver_detection),
         ("残差分析(修正)", test_correction_detection),
         ("无TLE合成分析", test_no_tle_synthesis),
+        # Phase 1: 衰降追踪器测试
+        ("衰降-正常轨道", test_decay_normal_orbit),
+        ("衰降-早期(数据不足)", test_decay_early_insufficient_data),
+        ("衰降-早期(稳定)", test_decay_early_stable),
+        ("衰降-加速衰减", test_decay_accelerating),
+        ("衰降-危险阶段", test_decay_critical),
+        ("衰降-CSV导出", test_decay_csv_export),
+        # Phase 1.5: 物理传播触发测试
+        ("ECI→开普勒转换", test_eci_to_keplerian_circular),
+        ("物理触发-近地点快车道", test_periapsis_fast_track),
+        ("物理触发-安全区跳过", test_sensitive_zone_bypass),
+        ("物理触发-回退静态阈值", test_static_fallback_trigger),
     ]
     
     results = []
@@ -305,7 +870,7 @@ def main():
     print(f"总计: {passed}/{total} 个测试通过")
     
     if passed == total:
-        print("\n所有测试通过！xpropagator 集成正常。")
+        print("\n所有测试通过！xpropagator + Phase 1 衰降追踪 + 物理触发正常。")
         return 0
     else:
         print(f"\n有 {total - passed} 个测试失败，请检查配置。")

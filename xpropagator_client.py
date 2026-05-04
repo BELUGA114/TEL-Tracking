@@ -40,7 +40,7 @@ from __future__ import annotations
 import logging
 import math
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import NamedTuple, Optional
 
 log = logging.getLogger(__name__)
@@ -197,6 +197,108 @@ def position_residual_km(sv_a: StateVector, sv_b: StateVector) -> float:
         + (sv_a.z - sv_b.z) ** 2
     )
 
+# ── ECI → Keplerian orbital element conversion ──────────────────────────────
+_EARTH_MU = 398600.4418   # Earth gravitational parameter (km^3/s^2)
+_EARTH_RE = 6378.137      # Earth equatorial radius (km)
+
+
+def state_vector_to_keplerian(sv: StateVector) -> dict:
+    """
+    Convert ECI Cartesian state vector (km, km/s) to Keplerian orbital elements.
+
+    Returns dict with keys: semi_major_axis_km, eccentricity, inclination_deg,
+    raan_deg, arg_periapsis_deg, true_anomaly_deg, periapsis_km, apoapsis_km,
+    period_min.
+    """
+    x, y, z = sv.x, sv.y, sv.z
+    vx, vy, vz = sv.vx, sv.vy, sv.vz
+
+    r_mag = math.sqrt(x * x + y * y + z * z)
+    v_mag = math.sqrt(vx * vx + vy * vy + vz * vz)
+
+    if r_mag < 1e-9:
+        return {
+            "semi_major_axis_km": 0.0, "eccentricity": 0.0,
+            "inclination_deg": 0.0, "raan_deg": 0.0,
+            "arg_periapsis_deg": 0.0, "true_anomaly_deg": 0.0,
+            "periapsis_km": 0.0, "apoapsis_km": 0.0, "period_min": 0.0,
+        }
+
+    # Angular momentum h = r x v
+    hx = y * vz - z * vy
+    hy = z * vx - x * vz
+    hz = x * vy - y * vx
+    h_mag = math.sqrt(hx * hx + hy * hy + hz * hz)
+
+    # Semi-major axis via vis-viva: a = 1 / (2/r - v^2/mu)
+    sma = 1.0 / (2.0 / r_mag - v_mag * v_mag / _EARTH_MU)
+
+    # Eccentricity vector e = (v x h)/mu - r/|r|
+    ex = (vy * hz - vz * hy) / _EARTH_MU - x / r_mag
+    ey = (vz * hx - vx * hz) / _EARTH_MU - y / r_mag
+    ez = (vx * hy - vy * hx) / _EARTH_MU - z / r_mag
+    ecc = math.sqrt(ex * ex + ey * ey + ez * ez)
+
+    # Periapsis / apoapsis distances (from centre), then altitudes
+    rp_geo = sma * (1.0 - ecc)
+    ra_geo = sma * (1.0 + ecc) if ecc < 1.0 else float("inf")
+    periapsis_km = rp_geo - _EARTH_RE
+    apoapsis_km = ra_geo - _EARTH_RE
+
+    # Inclination
+    inc = math.degrees(math.acos(max(-1.0, min(1.0, hz / h_mag)))) if h_mag > 1e-15 else 0.0
+
+    # Node vector n = k x h = (-hy, hx, 0)
+    nx = -hy
+    ny = hx
+    n_mag = math.sqrt(nx * nx + ny * ny)
+
+    # RAAN
+    if n_mag > 1e-15:
+        raan = math.degrees(math.acos(max(-1.0, min(1.0, nx / n_mag))))
+        if ny < 0:
+            raan = 360.0 - raan
+    else:
+        raan = 0.0
+
+    # Argument of periapsis
+    if ecc > 1e-12 and n_mag > 1e-15:
+        cos_omega = (nx * ex + ny * ey) / (n_mag * ecc)
+        argp = math.degrees(math.acos(max(-1.0, min(1.0, cos_omega))))
+        if ez < 0:
+            argp = 360.0 - argp
+    else:
+        argp = 0.0
+
+    # True anomaly
+    if ecc > 1e-12:
+        cos_nu = (ex * x + ey * y + ez * z) / (ecc * r_mag)
+        nu = math.degrees(math.acos(max(-1.0, min(1.0, cos_nu))))
+        # Radial velocity sign: r·v = (x*vx + y*vy + z*vz)
+        if x * vx + y * vy + z * vz < 0:
+            nu = 360.0 - nu
+    else:
+        # Circular: use true argument of latitude instead
+        nu = 0.0
+
+    # Period from Kepler's third law
+    period_min = 0.0
+    if sma > 0:
+        period_min = 2.0 * math.pi * math.sqrt(sma * sma * sma / _EARTH_MU) / 60.0
+
+    return {
+        "semi_major_axis_km": sma,
+        "eccentricity": ecc,
+        "inclination_deg": inc,
+        "raan_deg": raan,
+        "arg_periapsis_deg": argp,
+        "true_anomaly_deg": nu,
+        "periapsis_km": periapsis_km,
+        "apoapsis_km": apoapsis_km,
+        "period_min": period_min,
+    }
+
+
 def _resolve_tle(orbit_dict: dict) -> tuple[str, str] | None:
     """从 orbit dict 获取 TLE，优先使用现成数据，缺失时从 _raw_elements 合成。"""
     tle1, tle2 = orbit_dict.get("tle1", ""), orbit_dict.get("tle2", "")
@@ -312,6 +414,110 @@ def is_service_alive(host: str = XPROP_HOST, port: int = XPROP_PORT) -> bool:
     except Exception as exc:
         log.warning("xpropagator 服务探活失败: %s", exc)
         return False
+
+def is_grpc_available() -> bool:
+    """Return whether the gRPC stubs were loaded successfully."""
+    return _GRPC_AVAILABLE
+
+
+def propagate_and_check_decay_trend(
+    norad_id: int,
+    name: str,
+    tle1: str,
+    tle2: str,
+    epoch_dt: datetime,
+    *,
+    forecast_days: int = 30,
+    step_days: int = 3,
+    min_decline_km: float = 10.0,
+    min_r_squared: float = 0.5,
+    terminal_apo_threshold_km: float = 250.0,
+    host: str = XPROP_HOST,
+    port: int = XPROP_PORT,
+) -> Optional[dict]:
+    """
+    Propagate current TLE forward and check for sustained altitude decline.
+
+    Propagates at evenly-spaced time points from epoch_dt to
+    epoch_dt + forecast_days. At each point, converts the ECI state vector
+    to Keplerian elements and records periapsis/apoapsis.
+
+    Returns None if propagation fails completely. Otherwise returns a dict
+    with keys: triggered, forecast_points, apo_series, peri_series,
+    times_days, slope_km_per_day, r_squared, total_apo_decline_km,
+    decline_sustained, decline_significant, terminal_low.
+    """
+    if not _GRPC_AVAILABLE:
+        return None
+
+    n_steps = forecast_days // step_days + 1
+    target_times = [epoch_dt + timedelta(days=i * step_days) for i in range(n_steps)]
+
+    apo_series: list[float] = []
+    peri_series: list[float] = []
+    times_days: list[float] = []
+
+    for i, t in enumerate(target_times):
+        sv = propagate_tle(norad_id, name, tle1, tle2, t, host, port)
+        if sv is None:
+            continue
+        kep = state_vector_to_keplerian(sv)
+        if kep["periapsis_km"] <= 0:
+            continue
+        times_days.append(i * step_days)
+        apo_series.append(kep["apoapsis_km"])
+        peri_series.append(kep["periapsis_km"])
+
+    forecast_points = len(times_days)
+    if forecast_points < 3:
+        return None
+
+    # Simple linear regression on apoapsis time series
+    n = len(times_days)
+    n_f = float(n)
+    sum_x = sum(times_days)
+    sum_y = sum(apo_series)
+    sum_xy = sum(xi * yi for xi, yi in zip(times_days, apo_series))
+    sum_x2 = sum(xi * xi for xi in times_days)
+    sum_y2 = sum(yi * yi for yi in apo_series)
+
+    denom = n_f * sum_x2 - sum_x * sum_x
+    if abs(denom) < 1e-15:
+        return None
+
+    slope = (n_f * sum_xy - sum_x * sum_y) / denom
+    intercept = (sum_y - slope * sum_x) / n_f
+
+    mean_y = sum_y / n_f
+    ss_tot = sum_y2 - n_f * mean_y * mean_y
+    if ss_tot < 1e-15:
+        r_squared = 1.0 if abs(slope) < 1e-15 else 0.0
+    else:
+        ss_res = sum((yi - (slope * xi + intercept)) ** 2
+                     for xi, yi in zip(times_days, apo_series))
+        r_squared = max(0.0, 1.0 - ss_res / ss_tot)
+
+    total_decline = apo_series[-1] - apo_series[0]
+    decline_sustained = slope < 0 and r_squared >= min_r_squared
+    decline_significant = abs(total_decline) >= min_decline_km
+    terminal_low = apo_series[-1] < terminal_apo_threshold_km
+
+    triggered = (decline_sustained and decline_significant) or terminal_low
+
+    return {
+        "triggered": triggered,
+        "forecast_points": forecast_points,
+        "apo_series": apo_series,
+        "peri_series": peri_series,
+        "times_days": times_days,
+        "slope_km_per_day": slope,
+        "r_squared": r_squared,
+        "total_apo_decline_km": total_decline,
+        "decline_sustained": decline_sustained,
+        "decline_significant": decline_significant,
+        "terminal_low": terminal_low,
+    }
+
 
 def _tle_checksum(line: str) -> int:
     """计算 TLE 行校验位（末位数字）

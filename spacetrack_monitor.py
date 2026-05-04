@@ -160,6 +160,9 @@ except ImportError:
 # 实际是否可用 = 配置开启 + 模块导入成功
 XPROP_ACTIVE: bool = XPROP_ENABLED and _XPROP_MODULE_OK
 
+# 衰降追踪器
+import decay_tracker as dt
+
 
 def rotate_file_if_needed(filepath: str, max_size: int = MAX_LOG_SIZE) -> None:
     """如果文件超过 max_size，将其重命名为 .bak 实现轮转"""
@@ -1078,6 +1081,64 @@ def run_celestrak_cycle(
 
     return any_success
 
+
+# ── 衰降追踪集成 ────────────────────────────────────────────────────────────────
+
+DECAY_STATE_FILE = "decay_state.json"
+
+def _load_decay_state() -> dict[int, str]:
+    """加载上次已知的衰降阶段，用于避免重复告警"""
+    try:
+        if os.path.exists(DECAY_STATE_FILE):
+            with open(DECAY_STATE_FILE, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            return {int(k): v for k, v in raw.items()}
+    except (OSError, json.JSONDecodeError, ValueError) as e:
+        log.warning("衰降状态文件加载失败: %s", e)
+    return {}
+
+
+def _save_decay_state(state: dict[int, str]) -> None:
+    """持久化当前衰降阶段"""
+    try:
+        with open(DECAY_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump({str(k): v for k, v in state.items()}, f, ensure_ascii=False)
+    except OSError as e:
+        log.warning("衰降状态文件写入失败: %s", e)
+
+
+def _run_decay_analysis(prev_data: dict[int, dict], decay_state: dict[int, str]) -> None:
+    """
+    对所有已记录的卫星执行衰降分析，阶段变化时记录告警。
+    """
+    for nid in NORAD_IDS:
+        orbit = prev_data.get(nid)
+        if orbit is None:
+            continue
+
+        analysis = dt.analyze_decay(orbit, DATA_FILE)
+        if analysis["phase"] == dt.DecayPhase.NORMAL:
+            # 如果之前处于衰降阶段，现在恢复正常，也记录一次
+            if decay_state.get(nid, dt.DecayPhase.NORMAL) != dt.DecayPhase.NORMAL:
+                log.info("[%d] 已退出衰降监视（前向传播/静态阈值判定为正常轨道）", nid)
+                decay_state[nid] = dt.DecayPhase.NORMAL
+                _save_decay_state(decay_state)
+            continue
+
+        last_phase = decay_state.get(nid)
+        if analysis["phase"] != last_phase:
+            report = dt.format_decay_report(analysis)
+            log.info("\n%s", report)
+            if analysis["alert"]:
+                write_log_message(analysis["alert"])
+            decay_state[nid] = analysis["phase"]
+            _save_decay_state(decay_state)
+
+            # 进入加速或危险阶段时导出 B* 时间序列 CSV
+            if analysis["phase"] in (dt.DecayPhase.ACCELERATING,
+                                     dt.DecayPhase.CRITICAL):
+                dt.export_bstar_csv(nid, DATA_FILE)
+
 # 主程序
 
 def main() -> None:
@@ -1156,6 +1217,10 @@ def main() -> None:
         if orbit:
             print_orbit(orbit, None)
 
+    # 加载衰降追踪状态，执行初始检查
+    decay_state = _load_decay_state()
+    _run_decay_analysis(prev_data, decay_state)
+
     # 主循环
     consecutive_failures = {"count": 0}  # 主源连续失败计数
     active_source = PRIMARY_SOURCE       # 当前实际使用的数据源
@@ -1225,6 +1290,9 @@ def main() -> None:
                             active_source = "spacetrack"
                     else:
                         consecutive_failures["count"] += 1
+
+                # 衰降追踪分析
+                _run_decay_analysis(prev_data, decay_state)
 
                 # 备源切换判断
                 if (consecutive_failures["count"] >= FALLBACK_THRESHOLD
@@ -1313,7 +1381,10 @@ def main() -> None:
                                 log.error("备源 Space-Track 登录失败或请求失败，请检查凭据是否过期")
                         else:
                             log.error("备源 Space-Track 登录失败，请检查凭据是否过期")
-            
+
+            # 衰降追踪分析
+            _run_decay_analysis(prev_data, decay_state)
+
             # 更新轮询时间戳（每次轮询完成后记录）
             celestrak_last_poll = time.monotonic()
             try:
