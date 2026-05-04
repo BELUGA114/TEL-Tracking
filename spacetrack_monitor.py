@@ -23,17 +23,19 @@ import os
 from dotenv import load_dotenv
 from datetime import datetime, timezone, timedelta
 from enum import Enum, auto
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
 import requests
 import yaml
 
 # CelesTrak 拉取模块（可选，主源为 celestrak 时启用）
+if TYPE_CHECKING:
+    import celestrak_fetcher as ct
+
 try:
     import celestrak_fetcher as ct
     _CT_MODULE_OK = True
 except ImportError:
-    ct = None           # type: ignore
     _CT_MODULE_OK = False
 
 # 初始化日志系统（必须在配置加载之前）
@@ -145,15 +147,15 @@ logging.getLogger("xpropagator_client").setLevel(logging.INFO)
 
 log = logging.getLogger(__name__)
 
+if TYPE_CHECKING:
+    from xpropagator_client import classify_change_xprop, is_service_alive, _parse_epoch_utc
+
 # xpropagator 客户端（插件式，找不到模块时自动禁用）
 try:
     from xpropagator_client import classify_change_xprop, is_service_alive, _parse_epoch_utc
     _XPROP_MODULE_OK = True
 except ImportError:
     _XPROP_MODULE_OK = False
-    classify_change_xprop = None   # type: ignore 忽略
-    is_service_alive = None  # type: ignore 忽略
-    _parse_epoch_utc = None  # type: ignore 忽略
 
 # 实际是否可用 = 配置开启 + 模块导入成功
 XPROP_ACTIVE: bool = XPROP_ENABLED and _XPROP_MODULE_OK
