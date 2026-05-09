@@ -1173,9 +1173,10 @@ def test_percentile():
     else:
         print("  [FAIL]")
     return ok
+    
     """运行所有测试"""
+def main():
     print("\n" + "xpropagator 集成测试套件".center(50) + "\n")
-
     tests = [
         # xpropagator 集成测试
         ("服务连接", test_service_connection),
