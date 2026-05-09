@@ -41,7 +41,15 @@ import logging
 import math
 import time
 from datetime import datetime, timezone, timedelta
-from typing import NamedTuple, Optional
+from typing import TYPE_CHECKING, NamedTuple, Optional
+
+if TYPE_CHECKING:
+    import grpc
+    from google.protobuf import empty_pb2
+    from google.protobuf.timestamp_pb2 import Timestamp
+    from api.v1 import main_pb2_grpc as pb2_grpc
+    from api.v1.core import prop_pb2
+    from api.v1 import common_pb2
 
 log = logging.getLogger(__name__)
 
@@ -143,6 +151,7 @@ def propagate_tle(
     if not _GRPC_AVAILABLE:
         return None
 
+    channel = None
     try:
         channel = grpc.insecure_channel(
             f"{host}:{port}",
@@ -183,10 +192,11 @@ def propagate_tle(
                     norad_id, target_time.isoformat(), exc)
         return None
     finally:
-        try:
-            channel.close()
-        except Exception:
-            pass
+        if channel is not None:
+            try:
+                channel.close()
+            except Exception:
+                pass
 
 
 def position_residual_km(sv_a: StateVector, sv_b: StateVector) -> float:

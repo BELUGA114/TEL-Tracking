@@ -19,11 +19,13 @@ from xpropagator_client import (
 )
 from datetime import datetime, timezone, timedelta
 import json
+import math
 import os
 import sys
 import tempfile
 
 import decay_tracker as dt
+import reentry_window as rw
 
 
 def test_service_connection():
@@ -818,6 +820,165 @@ def test_static_fallback_trigger():
     return ok
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# Phase 2: 再入概率窗口测试
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def test_bstar_to_ballistic():
+    """测试 16: B* → 弹道系数转换"""
+    print("=" * 60)
+    print("测试 16: B* → 弹道系数转换")
+    print("=" * 60)
+
+    # B* = 0 → ballistic = 0
+    bc = rw.bstar_to_ballistic_coefficient(0.0)
+    print(f"  B*=0 → Cd*A/m = {bc:.2f} (期望 0)")
+    ok = abs(bc) < 1e-15
+
+    # B* < 0 → ballistic = 0
+    bc = rw.bstar_to_ballistic_coefficient(-1e-4)
+    print(f"  B*=-1e-4 → Cd*A/m = {bc:.2f} (期望 0)")
+    ok = ok and abs(bc) < 1e-15
+
+    # B* = 1e-4 → _BSTAR_DRAG_SCALE * 2*1e-4/2.461e-5 ≈ 0.002 * 8.127 ≈ 0.01625
+    bc = rw.bstar_to_ballistic_coefficient(1e-4)
+    expected = 0.002 * 2.0 * 1e-4 / 2.461e-5
+    print(f"  B*=1e-4 → Cd*A/m = {bc:.4f} (期望 {expected:.4f})")
+    ok = ok and abs(bc - expected) / expected < 1e-6
+
+    if ok:
+        print("  [OK] 通过")
+    else:
+        print("  [FAIL]")
+    return ok
+
+
+def test_rk4_circular_orbit_preservation():
+    """测试 17: RK4 圆轨道守恒 — 无阻力时高度应稳定"""
+    print("\n" + "=" * 60)
+    print("测试 17: RK4 圆轨道守恒（ballistic_coeff=0）")
+    print("=" * 60)
+
+    from xpropagator_client import _EARTH_MU, _EARTH_RE
+
+    # 构造 ~420 km 圆轨道（ISS 类似高度）
+    mu = _EARTH_MU
+    r_e = _EARTH_RE
+    r = r_e + 420.0  # ~6798 km
+    v = (mu / r) ** 0.5  # ~7.66 km/s
+
+    # 在赤道平面 (xy) 中：位置沿 x 轴，速度沿 y 轴
+    state_0 = [r, 0.0, 0.0, 0.0, v, 0.0]
+
+    # 预估轨道周期 (s)
+    period_sec = 2.0 * math.pi * (r ** 3 / mu) ** 0.5
+    n_orbits = 10
+    total_time = n_orbits * period_sec
+    dt = 10.0  # 10s 步长
+
+    # 积分
+    alt_init = rw.altitude_from_state(StateVector(*state_0))
+    print(f"  初始高度: {alt_init:.2f} km")
+    print(f"  轨道周期: {period_sec / 60:.2f} min")
+    print(f"  积分 {n_orbits} 圈 ≈ {total_time / 3600:.1f} 小时")
+
+    state = list(state_0)
+    alts = [alt_init]
+    elapsed = 0.0
+    while elapsed < total_time:
+        state = rw.rk4_step(state, ballistic_coeff=0.0, dt=dt)
+        elapsed += dt
+        if elapsed % (period_sec / 10) < dt:  # 每 1/10 圈记录一次
+            alt = rw.altitude_from_state(StateVector(*state))
+            alts.append(alt)
+
+    alt_final = rw.altitude_from_state(StateVector(*state))
+    drift = alt_final - alt_init
+
+    print(f"  最终高度: {alt_final:.2f} km  (漂移 {drift:+.4f} km)")
+    print(f"  期望漂移 < 1 km")
+
+    # 也检查半长轴守恒
+    sma_init = r
+    r_final = math.sqrt(state[0]**2 + state[1]**2 + state[2]**2)
+    v_final = math.sqrt(state[3]**2 + state[4]**2 + state[5]**2)
+    sma_final = 1.0 / (2.0 / r_final - v_final**2 / mu)
+    sma_drift = sma_final - sma_init
+    print(f"  半长轴漂移: {sma_drift:+.4f} km (期望 < 1 km)")
+
+    ok = abs(drift) < 1.0 and abs(sma_drift) < 1.0
+    if ok:
+        print("  [OK] 通过")
+    else:
+        print("  [FAIL]")
+    return ok
+
+
+def test_rk4_drag_decay():
+    """测试 18: RK4 阻力衰减 — 有阻力时高度单调下降"""
+    print("\n" + "=" * 60)
+    print("测试 18: RK4 阻力衰减（ballistic_coeff > 0）")
+    print("=" * 60)
+
+    from xpropagator_client import _EARTH_MU, _EARTH_RE
+
+    mu = _EARTH_MU
+    r_e = _EARTH_RE
+
+    # 在 250 km 高度构造圆轨道
+    r = r_e + 250.0
+    v = (mu / r) ** 0.5
+    state_0 = [r, 0.0, 0.0, 0.0, v, 0.0]
+
+    # 使用典型 LEO 卫星 B* = 1e-3（偏高，让衰减更快可见）
+    bstar = 1e-3
+    ballistic_coeff = rw.bstar_to_ballistic_coefficient(bstar)
+    print(f"  B* = {bstar:.1e}  ->  Cd*A/m = {ballistic_coeff:.2f} m2/kg")
+
+    alt_init = rw.altitude_from_state(StateVector(*state_0))
+    print(f"  初始高度: {alt_init:.2f} km")
+
+    # 积分约 0.5 天，步长 10s
+    dt = 10.0
+    max_time = 43200.0  # 12 小时
+
+    state = list(state_0)
+    alts = [alt_init]
+    times = [0.0]
+    elapsed = 0.0
+    while elapsed < max_time:
+        state = rw.rk4_step(state, ballistic_coeff, dt)
+        elapsed += dt
+        alt = rw.altitude_from_state(StateVector(*state))
+        if alt <= 80.0:
+            break
+        # 每 0.5 小时记录一次
+        period_sec = 5400.0  # ~90 min
+        if elapsed % (period_sec / 6) < dt:
+            alts.append(alt)
+            times.append(elapsed / 3600.0)
+
+    alt_final = rw.altitude_from_state(StateVector(*state))
+    print(f"  最终高度: {alt_final:.2f} km  (积分 {elapsed / 3600:.2f} 小时)")
+    print(f"  总下降: {alt_init - alt_final:.2f} km")
+
+    # 检查单调性（允许数值浮动导致的微小振荡，容差 1e-6 km）
+    monotonically_decreasing = True
+    for i in range(1, len(alts)):
+        if alts[i] > alts[i - 1] + 1e-6:
+            monotonically_decreasing = False
+            print(f"  [FAIL] 高度非单调下降: {alts[i - 1]:.4f} → {alts[i]:.4f} "
+                  f"(t={times[i]:.2f}h)")
+            break
+
+    ok = monotonically_decreasing and alt_final < alt_init
+    if ok:
+        print("  [OK] 通过")
+    else:
+        print("  [FAIL]")
+    return ok
+
+
 def main():
     """运行所有测试"""
     print("\n" + "xpropagator 集成测试套件".center(50) + "\n")
@@ -841,6 +1002,10 @@ def main():
         ("物理触发-近地点快车道", test_periapsis_fast_track),
         ("物理触发-安全区跳过", test_sensitive_zone_bypass),
         ("物理触发-回退静态阈值", test_static_fallback_trigger),
+        # Phase 2: 再入概率窗口测试
+        ("B*→弹道系数", test_bstar_to_ballistic),
+        ("RK4圆轨道守恒", test_rk4_circular_orbit_preservation),
+        ("RK4阻力衰减", test_rk4_drag_decay),
     ]
     
     results = []
