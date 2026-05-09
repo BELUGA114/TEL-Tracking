@@ -979,7 +979,200 @@ def test_rk4_drag_decay():
     return ok
 
 
-def main():
+def test_handoff_bisection():
+    """测试 19: 交接点二分查找 — 模拟线性下降，验证 10s 精度"""
+    print("\n" + "=" * 60)
+    print("测试 19: 交接点二分查找")
+    print("=" * 60)
+
+    from unittest.mock import patch
+    from xpropagator_client import _EARTH_RE, _EARTH_MU
+
+    t0 = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+    def _mock_decay_prop(norad_id, name, tle1, tle2, target_time, host, port):
+        """Mock: altitude 300 km → 100 km over 10 days, fixed circular orbit."""
+        elapsed_days = (target_time - t0).total_seconds() / 86400.0
+        alt = 300.0 - 200.0 * max(0, elapsed_days) / 10.0  # 300→100 in 10d
+        alt = max(alt, 0.0)
+        r = _EARTH_RE + alt
+        v = math.sqrt(_EARTH_MU / r)
+        return StateVector(r, 0.0, 0.0, 0.0, v, 0.0)
+
+    true_handoff = t0 + timedelta(days=5)  # 200 km crossing at day 5
+    print(f"  真实穿越时间: day 5 = {true_handoff.isoformat()}")
+
+    with patch("reentry_window.propagate_tle", side_effect=_mock_decay_prop):
+        result = rw.find_200km_handoff(
+            norad_id=99999, name="MOCK-HANDOFF",
+            tle1="1 99999", tle2="2 99999", epoch_dt=t0,
+        )
+
+    if result is None:
+        print("  [FAIL] 未找到交接点")
+        return False
+
+    handoff_time, handoff_sv = result
+    error_s = abs((handoff_time - true_handoff).total_seconds())
+    handoff_alt = rw.altitude_from_state(handoff_sv)
+
+    print(f"  实际穿越时间: {handoff_time.isoformat()}")
+    print(f"  时间误差: {error_s:.2f} s (期望 ≤ {rw._HANDOFF_BISECTION_SECONDS:.0f} s)")
+    print(f"  交接高度: {handoff_alt:.2f} km (期望 ~200 km)")
+
+    ok = error_s <= rw._HANDOFF_BISECTION_SECONDS and abs(handoff_alt - 200.0) < 1.0
+    if ok:
+        print("  [OK] 通过")
+    else:
+        print("  [FAIL]")
+    return ok
+
+
+def test_mini_integrator_calibration():
+    """测试 20: Mini 积分器 v0 校准 — 二分法收敛到 dh/dt 容差内"""
+    print("\n" + "=" * 60)
+    print("测试 20: Mini 积分器 v0 校准")
+    print("=" * 60)
+
+    from xpropagator_client import _EARTH_RE, _EARTH_MU
+
+    # 近地点径向速度为 0 时校准最可靠（dh/dt 不受轨道运动污染）
+    r = _EARTH_RE + 200.0
+    v_circ = math.sqrt(_EARTH_MU / r)
+
+    handoff = StateVector(x=r, y=0.0, z=0.0, vx=0.0, vy=v_circ, vz=0.0)
+
+    dh_dt_sgp4 = 0.0
+    print(f"  SGP4 dh/dt (近地点径向速率): {dh_dt_sgp4:.1f} km/s")
+    print(f"  圆轨道速度: {v_circ:.6f} km/s")
+
+    ballistic_coeff = 0.05
+
+    v0 = rw.calibrate_mini_integrator(handoff, ballistic_coeff)
+
+    print(f"  校准后 v0: {v0:.8f} km/s")
+    v0_deviation = (v0 / v_circ - 1.0) * 100
+    print(f"  相对圆轨速度偏差: {v0_deviation:.6f}%")
+
+    dt = 10.0
+    orbit_period = 2.0 * math.pi * math.sqrt(r**3 / _EARTH_MU)
+    half_steps = max(1, int(orbit_period / (2.0 * dt)))
+
+    state = [r, 0.0, 0.0, 0.0, v0, 0.0]
+    for _ in range(half_steps):
+        state = rw.rk4_step(state, ballistic_coeff, dt)
+
+    r_final = math.sqrt(state[0]**2 + state[1]**2 + state[2]**2)
+    dh_dt_mini = (r_final - r) / (half_steps * dt)
+
+    print(f"  Mini 积分器 0.5 圈后高度: {r_final - _EARTH_RE:.6f} km")
+    print(f"  dh/dt_mini (半圈平均径向速率): {dh_dt_mini:.3e} km/s")
+    print(f"  |dh/dt_mini - dh/dt_sgp4|: {abs(dh_dt_mini):.2e} km/s"
+          f" (容差: {rw._CALIBRATION_DH_DT_TOLERANCE:.0e})")
+
+    ok = (v_circ * 0.95 <= v0 <= v_circ * 1.05) and abs(dh_dt_mini) < rw._CALIBRATION_DH_DT_TOLERANCE * 10
+    if ok:
+        print("  [OK] 通过")
+    else:
+        print("  [FAIL] 校准未收敛")
+    return ok
+
+
+def test_mc_small_sigma():
+    """测试 21: MC 小 σ_v → 再入时间紧凑"""
+    print("\n" + "=" * 60)
+    print("测试 21: MC 小 σ_v — 分布紧凑")
+    print("=" * 60)
+
+    from xpropagator_client import _EARTH_RE, _EARTH_MU
+    r = _EARTH_RE + 200.0
+    v = math.sqrt(_EARTH_MU / r)
+    handoff = rw.StateVector(x=r, y=0.0, z=0.0, vx=0.0, vy=v, vz=0.0)
+
+    ballistic_coeff = 0.05
+    times = rw.run_monte_carlo(handoff, v, ballistic_coeff,
+                               sigma_v_ms=0.01, n_samples=20, seed=42)
+
+    print(f"  有效样本: {len(times)}/20")
+    ok = len(times) > 0 and all(t > 0 for t in times)
+
+    if times:
+        sorted_t = sorted(times)
+        print(f"  再入时间范围: {sorted_t[0]:.0f}s ~ {sorted_t[-1]:.0f}s")
+        print(f"  中位数: {rw._percentile(sorted_t, 50.0):.0f}s")
+
+    if ok:
+        print("  [OK] 通过")
+    else:
+        print("  [FAIL]")
+    return ok
+
+
+def test_mc_large_sigma():
+    """测试 22: MC 大 σ_v → 分布显著宽于小 σ_v"""
+    print("\n" + "=" * 60)
+    print("测试 22: MC 大 σ_v — 分布展宽")
+    print("=" * 60)
+
+    from xpropagator_client import _EARTH_RE, _EARTH_MU
+    r = _EARTH_RE + 200.0
+    v = math.sqrt(_EARTH_MU / r)
+    handoff = rw.StateVector(x=r, y=0.0, z=0.0, vx=0.0, vy=v, vz=0.0)
+
+    ballistic_coeff = 0.05
+
+    times_small = rw.run_monte_carlo(handoff, v, ballistic_coeff,
+                                     sigma_v_ms=0.01, n_samples=30, seed=42)
+    times_large = rw.run_monte_carlo(handoff, v, ballistic_coeff,
+                                     sigma_v_ms=5.0, n_samples=30, seed=99)
+
+    ok = len(times_large) > 0 and len(times_small) > 0
+
+    if ok:
+        spread_small = max(times_small) - min(times_small)
+        spread_large = max(times_large) - min(times_large)
+        print(f"  小 σ_v 展宽: {spread_small:.0f}s")
+        print(f"  大 σ_v 展宽: {spread_large:.0f}s")
+        if spread_large > spread_small:
+            ok = True
+            print("  [OK] 大 σ_v 分布显著展宽")
+        else:
+            ok = False
+            print("  [FAIL] 大 σ_v 展宽不足")
+
+    return ok
+
+
+def test_percentile():
+    """测试 26: 百分位计算 — 已知数据验证 p50/p16/p84"""
+    print("\n" + "=" * 60)
+    print("测试 26: 百分位计算")
+    print("=" * 60)
+
+    data = [1.0, 2.0, 3.0, 4.0, 5.0]
+    p50 = rw._percentile(data, 50.0)
+    p16 = rw._percentile(data, 16.0)
+    p84 = rw._percentile(data, 84.0)
+
+    print(f"  data = {data}")
+    print(f"  p50 = {p50:.4f} (期望 3.0)")
+    print(f"  p16 = {p16:.4f} (期望 1.64)")
+    print(f"  p84 = {p84:.4f} (期望 4.36)")
+
+    ok = abs(p50 - 3.0) < 1e-10
+    ok = ok and abs(p16 - 1.64) < 1e-10
+    ok = ok and abs(p84 - 4.36) < 1e-10
+
+    ok = ok and abs(rw._percentile([], 50.0)) < 1e-10
+    ok = ok and abs(rw._percentile([42.0], 50.0) - 42.0) < 1e-10
+    ok = ok and abs(rw._percentile(data, 0.0) - 1.0) < 1e-10
+    ok = ok and abs(rw._percentile(data, 100.0) - 5.0) < 1e-10
+
+    if ok:
+        print("  [OK] 通过")
+    else:
+        print("  [FAIL]")
+    return ok
     """运行所有测试"""
     print("\n" + "xpropagator 集成测试套件".center(50) + "\n")
 
@@ -1006,6 +1199,11 @@ def main():
         ("B*→弹道系数", test_bstar_to_ballistic),
         ("RK4圆轨道守恒", test_rk4_circular_orbit_preservation),
         ("RK4阻力衰减", test_rk4_drag_decay),
+        ("交接点二分查找", test_handoff_bisection),
+        ("Mini积分器校准", test_mini_integrator_calibration),
+        ("MC小σ_v分布", test_mc_small_sigma),
+        ("MC大σ_v分布", test_mc_large_sigma),
+        ("百分位计算", test_percentile),
     ]
     
     results = []
