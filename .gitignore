@@ -1,12 +1,53 @@
-# 环境变量和密钥
+# ===== 环境变量与密钥 =====
 .env
+.env.local
+.env.*.local
 !.env.example
 
-# Python 字节码缓存
+# ===== Python =====
 __pycache__/
-*.pyc
+*.py[cod]
 *.pyo
-*.pyd
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+*.egg-info/
+dist/
+build/
+*.log
+
+# ===== Java =====
+*.class
+*.jar
+*.war
+*.ear
+target/
+build/
+.gradle/
+gradle-wrapper.jar
+
+# ===== IDE =====
+.idea/
+.vscode/
+*.iml
+.project
+.classpath
+
+# ===== 系统文件 =====
+.DS_Store
+Thumbs.db
+
+# ===== 临时文件 =====
+*.tmp
+*.bak
+*.swp
+*.swo
+*~
+
+# ===== Claude =====
+CLAUDE.md
 
 # 项目数据文件（运行时生成）
 tle_log.jsonl
@@ -14,26 +55,4 @@ tle_log.jsonl.bak
 tle_cache.json
 tle_data.jsonl
 tle_data.jsonl.bak
-
-# IDE 配置
-/.idea/
-.vscode/
-*.swp
-*.swo
-*~
-
-# 操作系统文件
-.DS_Store
-Thumbs.db
-
-# 临时文件和备份
-*.tmp
-*.bak
-*.log
-
-# 虚拟环境
-venv/
-env/
-.venv/
 celestrak_poll_cache.json
-CLAUDE.md
